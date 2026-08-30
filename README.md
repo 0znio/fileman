@@ -1,7 +1,6 @@
 # Fileman
 
-A fast GTK4/libadwaita file manager written in Rust, for Linux desktops that
-dual-boot Windows.
+A fast GTK4/libadwaita file manager written in Rust, for Linux.
 
 ![Fileman](docs/screenshot.png)
 

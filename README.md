@@ -119,6 +119,13 @@ the desktop stutter. Settings → Performance overrides it.
 curl -fsSL https://github.com/0znio/fileman/releases/latest/download/install.sh | sh
 ```
 
+Options go after `-s --`, because the script is being piped into `sh` rather
+than run as a file:
+
+```sh
+curl -fsSL .../install.sh | sh -s -- --from-source --prefix /usr/local
+```
+
 The script works out what this machine needs. It installs runtime dependencies
 with the distro's own package manager — apt, pacman, dnf, zypper, apk, xbps,
 emerge, eopkg — then downloads a prebuilt binary if one will run here, and

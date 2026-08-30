@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Fileman
+GenericName=File Manager
+Comment=Browse files, extract archives, and mount drives
+Exec=fileman %U
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileTools;FileManager;GTK;
+Keywords=files;folders;browse;archive;extract;mount;ntfs;
+MimeType=inode/directory;
+StartupNotify=true
+# Must match the Wayland app_id / X11 WM_CLASS that GTK sets from the
+# application id, or the compositor shows a generic icon for the window.
+StartupWMClass=dev.fileman.Files

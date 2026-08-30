@@ -18,6 +18,28 @@ pub fn run() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
+    // `--help` and `--version` have to be answered without a display: they are
+    // the first thing a packaging script or a person on a broken install runs,
+    // and before this they simply opened a window and hung.
+    app.add_main_option(
+        "version",
+        glib::Char::from(b'V'),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Print the version and exit",
+        None,
+    );
+    app.connect_handle_local_options(|_, options| {
+        use std::ops::ControlFlow;
+        if options.lookup::<bool>("version").ok().flatten().unwrap_or(false) {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            // `Break` short-circuits with this exit code; `Continue` carries on
+            // into the normal startup path.
+            return ControlFlow::Break(glib::ExitCode::SUCCESS);
+        }
+        ControlFlow::Continue(())
+    });
+
     crate::trace::init();
 
     app.connect_startup(|_| {

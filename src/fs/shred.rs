@@ -422,11 +422,11 @@ pub fn start_shred(paths: Vec<PathBuf>, passes: u32) -> JobHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
 
     #[test]
     fn shredding_removes_the_file() {
-        let dir = std::env::temp_dir().join(format!("fileman-shred-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("shred");
         let file = dir.join("secret.txt");
         fs::write(&file, vec![0xABu8; 4096]).unwrap();
 
@@ -434,7 +434,6 @@ mod tests {
         shred_file(&file, 2, &cancel, |_| {}).unwrap();
 
         assert!(!file.exists());
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// Exercises the parallel path end to end: enough files to be handed out
@@ -443,8 +442,7 @@ mod tests {
     /// reporting concurrently.
     #[test]
     fn shredding_a_tree_removes_every_file_and_directory() {
-        let root = std::env::temp_dir().join(format!("fileman-shred-tree-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = TempDir::new("shred-tree");
         let mut expected_bytes = 0u64;
         for d in 0..4 {
             let dir = root.join(format!("d{d}/nested"));
@@ -457,7 +455,7 @@ mod tests {
         }
 
         let passes = 2;
-        let job = start_shred(vec![root.clone()], passes);
+        let job = start_shred(vec![root.path().to_path_buf()], passes);
         let mut outcome = None;
         while let Ok(message) = job.progress.recv_blocking() {
             if let Progress::Finished(done) = message {
@@ -474,13 +472,12 @@ mod tests {
             expected_bytes * passes as u64,
             "byte total must survive concurrent reporting"
         );
-        assert!(!root.exists(), "the whole tree must be gone, directories included");
+        assert!(!root.path().exists(), "the whole tree must be gone, directories included");
     }
 
     #[test]
     fn shredding_a_symlink_leaves_its_target_intact() {
-        let dir = std::env::temp_dir().join(format!("fileman-shred-link-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("shred-link");
         let target = dir.join("target.txt");
         let link = dir.join("link.txt");
         fs::write(&target, b"keep me").unwrap();
@@ -491,6 +488,5 @@ mod tests {
 
         assert!(!link.exists());
         assert_eq!(fs::read(&target).unwrap(), b"keep me");
-        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -115,20 +115,41 @@ the desktop stutter. Settings → Performance overrides it.
 
 ## Install
 
-Runtime: `gtk4`, `libadwaita`, `libarchive`, `udisks2`, and a polkit agent.
-Optional: `pigz` for threaded `.tar.gz`, `ntfs-3g` for NTFS repair, `gvfs` for
-trash on removable drives. Build needs Rust 1.92+.
+```sh
+curl -fsSL https://github.com/0znio/fileman/releases/latest/download/install.sh | sh
+```
+
+The script works out what this machine needs. It installs runtime dependencies
+with the distro's own package manager — apt, pacman, dnf, zypper, apk, xbps,
+emerge, eopkg — then downloads a prebuilt binary if one will run here, and
+builds from source if not.
+
+| Option | Effect |
+| --- | --- |
+| `--from-source` | Build with cargo instead of downloading |
+| `--binary` | Download only; fail rather than build |
+| `--prefix DIR` | Install under `DIR` (default `/usr/local`, or `~/.local` without root) |
+| `--no-deps` | Leave the package manager alone |
+| `--uninstall` | Remove it again |
+
+**The prebuilt binary needs glibc ≥ 2.39, GTK ≥ 4.12 and libadwaita ≥ 1.5** —
+Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, openSUSE Tumbleweed and their
+derivatives. On anything older, on musl (Alpine), or on a non-x86_64 machine the
+script builds from source instead, which needs Rust 1.92+.
+
+### From a checkout
 
 ```sh
-# Arch
-sudo pacman -S --needed rust gtk4 libadwaita libarchive udisks2 ntfs-3g pigz
-
 make            # cargo build --release
 make test
 make install    # to ~/.local — no root needed
 ```
 
 System-wide: `sudo make install PREFIX=/usr/local`. Run with `fileman [path]`.
+
+Dependencies, if you'd rather install them yourself: `gtk4`, `libadwaita`,
+`libarchive`, `udisks2` and a polkit agent at runtime; `pigz` for threaded
+`.tar.gz` and `ntfs-3g` for NTFS repair are optional.
 
 ## Shortcuts
 

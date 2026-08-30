@@ -163,17 +163,11 @@ fn describe(path: &Path) -> Option<FileEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
     use std::fs;
 
-    fn tree() -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "fileman-search-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn tree() -> TempDir {
+        let root = TempDir::new("search");
         fs::create_dir_all(root.join("a/b/c")).unwrap();
         fs::create_dir_all(root.join(".hidden/deep")).unwrap();
         fs::write(root.join("top-fileman.txt"), b"x").unwrap();          // depth 1
@@ -207,7 +201,7 @@ mod tests {
     #[test]
     fn finds_matches_at_any_depth_below_the_folder() {
         let root = tree();
-        let handle = start(root.clone(), "fileman".into(), true);
+        let handle = start(root.path().to_path_buf(), "fileman".into(), true);
         let (names, total) = collect(&handle);
 
         // Depth 1 is deliberately excluded: the view already lists and filters
@@ -217,36 +211,31 @@ mod tests {
         assert!(names.contains(&"FILEMAN-deep.rs".to_string()), "got {names:?}");
         assert!(!names.contains(&"unrelated.txt".to_string()));
         assert_eq!(total, names.len());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn matching_is_case_insensitive() {
         let root = tree();
-        let handle = start(root.clone(), "FiLeMaN-DeEp".into(), true);
+        let handle = start(root.path().to_path_buf(), "FiLeMaN-DeEp".into(), true);
         let (names, _) = collect(&handle);
         assert_eq!(names, vec!["FILEMAN-deep.rs".to_string()]);
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn hidden_directories_are_skipped_unless_asked_for() {
         let root = tree();
 
-        let (hidden_off, _) = collect(&start(root.clone(), "secret".into(), true));
+        let (hidden_off, _) = collect(&start(root.path().to_path_buf(), "secret".into(), true));
         assert!(hidden_off.is_empty(), "got {hidden_off:?}");
 
-        let (hidden_on, _) = collect(&start(root.clone(), "secret".into(), false));
+        let (hidden_on, _) = collect(&start(root.path().to_path_buf(), "secret".into(), false));
         assert_eq!(hidden_on, vec!["fileman-secret".to_string()]);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn dropping_the_handle_stops_the_walk() {
         let root = tree();
-        let handle = start(root.clone(), "fileman".into(), true);
+        let handle = start(root.path().to_path_buf(), "fileman".into(), true);
         handle.cancel();
         // After cancelling, the channel closes without delivering `Finished`.
         // The walk must not keep the thread alive holding the directory open.
@@ -255,6 +244,5 @@ mod tests {
                 break;
             }
         }
-        fs::remove_dir_all(&root).ok();
     }
 }

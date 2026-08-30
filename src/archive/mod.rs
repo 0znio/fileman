@@ -682,6 +682,7 @@ fn run_gzip_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
 
     #[test]
     fn entry_paths_cannot_escape_the_destination() {
@@ -707,7 +708,7 @@ mod tests {
             eprintln!("skipping: bsdtar unavailable");
             return;
         }
-        let root = tempdir("arc");
+        let root = TempDir::new("arc");
         let src = root.join("payload");
         fs::create_dir_all(src.join("nested")).unwrap();
         fs::write(src.join("top.txt"), b"hello").unwrap();
@@ -725,15 +726,13 @@ mod tests {
 
         assert_eq!(fs::read(dest.join("payload/top.txt")).unwrap(), b"hello");
         assert_eq!(fs::read(dest.join("payload/nested/deep.bin")).unwrap().len(), 5000);
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// The well-rooted case: one top-level folder is lifted out of the staging
     /// directory into the destination under its own name.
     #[test]
     fn a_well_rooted_archive_promotes_its_root_folder() {
-        let root = tempdir("promote-rooted");
+        let root = TempDir::new("promote-rooted");
         let into = root.join("into");
         let staging = into.join(".staging");
         fs::create_dir_all(staging.join("payload/nested")).unwrap();
@@ -744,15 +743,13 @@ mod tests {
         assert_eq!(placed, into.join("payload"));
         assert_eq!(fs::read(into.join("payload/a.txt")).unwrap(), b"a");
         assert!(!staging.exists(), "the staging directory must not be left behind");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// The loose case: several top-level entries keep the container, which is
     /// named after the archive so they don't scatter into the folder.
     #[test]
     fn a_loose_archive_keeps_a_container_named_after_it() {
-        let root = tempdir("promote-loose");
+        let root = TempDir::new("promote-loose");
         let into = root.join("into");
         let staging = into.join(".staging");
         fs::create_dir_all(&staging).unwrap();
@@ -764,8 +761,6 @@ mod tests {
         assert_eq!(placed, into.join("photos"));
         assert_eq!(fs::read(into.join("photos/a.txt")).unwrap(), b"a");
         assert!(into.join("photos/b.txt").exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Extracting over a folder that is already there replaces the entries the
@@ -773,7 +768,7 @@ mod tests {
     /// old extract-straight-into-place path had.
     #[test]
     fn promoting_onto_an_existing_folder_merges_into_it() {
-        let root = tempdir("promote-merge");
+        let root = TempDir::new("promote-merge");
         let into = root.join("into");
         let existing = into.join("payload");
         fs::create_dir_all(existing.join("nested")).unwrap();
@@ -790,24 +785,19 @@ mod tests {
         assert_eq!(fs::read(existing.join("keep.txt")).unwrap(), b"keep", "untouched file must survive");
         assert_eq!(fs::read(existing.join("nested/old.txt")).unwrap(), b"new", "archived file must win");
         assert!(!staging.exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A single top-level *file* is not a root; that archive keeps its container.
     #[test]
     fn a_lone_top_level_file_is_not_a_root() {
-        let root = tempdir("lone");
-        fs::create_dir_all(&root).unwrap();
+        let root = TempDir::new("lone");
         fs::write(root.join("only.txt"), b"x").unwrap();
-        assert_eq!(lone_child_directory(&root), None);
+        assert_eq!(lone_child_directory(root.path()), None);
 
         fs::remove_file(root.join("only.txt")).unwrap();
         let dir = root.join("sub");
         fs::create_dir_all(&dir).unwrap();
-        assert_eq!(lone_child_directory(&root), Some(dir));
-
-        fs::remove_dir_all(&root).ok();
+        assert_eq!(lone_child_directory(root.path()), Some(dir));
     }
 
     /// Only the codecs with a parallel encoder get a thread count; passing one
@@ -831,8 +821,7 @@ mod tests {
             eprintln!("skipping: bsdtar unavailable");
             return;
         }
-        let root = tempdir("extract-job");
-        let _ = fs::remove_dir_all(&root);
+        let root = TempDir::new("extract-job");
         let src = root.join("project");
         fs::create_dir_all(src.join("deep/deeper")).unwrap();
         fs::write(src.join("readme.md"), b"# hi").unwrap();
@@ -866,18 +855,14 @@ mod tests {
             .filter(|n| n != "project")
             .collect();
         assert!(leftovers.is_empty(), "staging directory left behind: {leftovers:?}");
-
-        fs::remove_dir_all(&root).ok();
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("fileman-{tag}-{}", std::process::id()))
-    }
 }
 
 #[cfg(test)]
 mod pigz_tests {
     use super::*;
+    use crate::testing::TempDir;
 
     /// The parallel-gzip pipeline is only taken when a `pigz` is on `PATH`, and
     /// most machines (including CI) do not have one. A shim with the same
@@ -897,17 +882,16 @@ mod pigz_tests {
             eprintln!("skipping: bsdtar unavailable");
             return;
         }
-        let root = std::env::temp_dir().join(format!("fileman-pigz-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = TempDir::new("pigz");
         fs::create_dir_all(root.join("payload")).unwrap();
         fs::write(root.join("payload/a.txt"), b"hello").unwrap();
         fs::write(root.join("payload/b.txt"), b"world").unwrap();
-        let shim = write_shim(&root);
+        let shim = write_shim(root.path());
 
         let src = root.join("payload");
         let dest = root.join("out.tar.gz");
         let mut cmd = Command::new(bsdtar_binary().unwrap());
-        cmd.arg("-C").arg(&root).arg("--format=ustar");
+        cmd.arg("-C").arg(root.path()).arg("--format=ustar");
         run_gzip_pipeline(cmd, std::slice::from_ref(&src), &dest, &shim, 4).unwrap();
 
         // Read it back through the real extractor: had the pipe mangled the
@@ -918,8 +902,6 @@ mod pigz_tests {
         extract_all(&dest, &out, None, &cancel, &tx).unwrap();
         assert_eq!(fs::read(out.join("payload/a.txt")).unwrap(), b"hello");
         assert_eq!(fs::read(out.join("payload/b.txt")).unwrap(), b"world");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// A tar that dies partway still produces a *valid* gzip stream of a
@@ -931,19 +913,15 @@ mod pigz_tests {
             eprintln!("skipping: bsdtar unavailable");
             return;
         }
-        let root = std::env::temp_dir().join(format!("fileman-pigz-fail-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let shim = write_shim(&root);
+        let root = TempDir::new("pigz-fail");
+        let shim = write_shim(root.path());
         let dest = root.join("bad.tar.gz");
 
         let mut cmd = Command::new(bsdtar_binary().unwrap());
-        cmd.arg("-C").arg(&root).arg("--format=ustar");
+        cmd.arg("-C").arg(root.path()).arg("--format=ustar");
         let result = run_gzip_pipeline(cmd, &[root.join("does-not-exist")], &dest, &shim, 4);
 
         assert!(result.is_err(), "a missing source must fail the job");
         assert!(!dest.exists(), "a failed run must not leave a partial archive");
-
-        fs::remove_dir_all(&root).ok();
     }
 }

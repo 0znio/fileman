@@ -59,10 +59,9 @@ jobs:
           DIR="fileman-${VERSION}-x86_64-linux"
           mkdir -p "dist/$DIR"
           cp target/release/fileman "dist/$DIR/"
-          cp README.md LICENSE "dist/$DIR/" 2>/dev/null || cp README.md "dist/$DIR/"
+          cp README.md LICENSE "dist/$DIR/"
           mkdir -p "dist/$DIR/share/applications"
           cp data/dev.fileman.Files.desktop "dist/$DIR/share/applications/"
-          cp install.sh "dist/$DIR/"
           printf 'glibc>=%s\ngtk4>=4.12\nlibadwaita>=1.5\n' \
             "${{ steps.reqs.outputs.glibc }}" > "dist/$DIR/REQUIREMENTS"
           tar -C dist -czf "dist/$DIR.tar.gz" "$DIR"
@@ -74,17 +73,22 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          # Binaries only. `install.sh` lives in the repository and is served
+          # from there, so it can be fixed without cutting a release and can
+          # never be a stale copy of the one in the tree.
           files: |
             dist/*.tar.gz
             dist/SHA256SUMS
-            install.sh
           generate_release_notes: true
           body: |
             Install on any supported distro:
 
             ```sh
-            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
             ```
+
+            Or download `fileman-*-x86_64-linux.tar.gz` below, check it against
+            `SHA256SUMS`, and copy the binary onto your `PATH`.
 
             Requires glibc >= ${{ steps.reqs.outputs.glibc }}, GTK >= 4.12 and
             libadwaita >= 1.5. The installer builds from source instead when

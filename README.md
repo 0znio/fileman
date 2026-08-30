@@ -115,48 +115,73 @@ the desktop stutter. Settings → Performance overrides it.
 
 ## Install
 
+### Script
+
 ```sh
-curl -fsSL https://github.com/0znio/fileman/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/0znio/fileman/main/install.sh | sh
 ```
+
+It works out what this machine needs: installs runtime dependencies with the
+distro's own package manager — apt, pacman, dnf, zypper, apk, xbps, emerge,
+eopkg — then downloads the prebuilt binary if one will run here, and builds from
+source if not.
 
 Options go after `-s --`, because the script is being piped into `sh` rather
 than run as a file:
 
 ```sh
-curl -fsSL .../install.sh | sh -s -- --from-source --prefix /usr/local
+curl -fsSL https://raw.githubusercontent.com/0znio/fileman/main/install.sh \
+  | sh -s -- --from-source --prefix /usr/local
 ```
-
-The script works out what this machine needs. It installs runtime dependencies
-with the distro's own package manager — apt, pacman, dnf, zypper, apk, xbps,
-emerge, eopkg — then downloads a prebuilt binary if one will run here, and
-builds from source if not.
 
 | Option | Effect |
 | --- | --- |
 | `--from-source` | Build with cargo instead of downloading |
 | `--binary` | Download only; fail rather than build |
 | `--prefix DIR` | Install under `DIR` (default `/usr/local`, or `~/.local` without root) |
+| `--version TAG` | A specific release instead of the latest |
 | `--no-deps` | Leave the package manager alone |
 | `--uninstall` | Remove it again |
 
-**The prebuilt binary needs glibc ≥ 2.39, GTK ≥ 4.12 and libadwaita ≥ 1.5** —
-Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, openSUSE Tumbleweed and their
-derivatives. On anything older, on musl (Alpine), or on a non-x86_64 machine the
-script builds from source instead, which needs Rust 1.92+.
+### Manual
 
-### From a checkout
+Releases carry the binary and its checksums. Grab both from the
+[latest release](https://github.com/0znio/fileman/releases/latest):
 
 ```sh
+curl -fsSLO https://github.com/0znio/fileman/releases/latest/download/SHA256SUMS
+curl -fsSLO https://github.com/0znio/fileman/releases/latest/download/fileman-0.1.1-x86_64-linux.tar.gz
+
+sha256sum -c SHA256SUMS          # verify before running anything
+tar -xzf fileman-*-x86_64-linux.tar.gz
+cd fileman-*-x86_64-linux
+
+install -Dm755 fileman ~/.local/bin/fileman
+install -Dm644 share/applications/dev.fileman.Files.desktop \
+  ~/.local/share/applications/dev.fileman.Files.desktop
+```
+
+You still need the runtime libraries — `gtk4`, `libadwaita`, `libarchive`,
+`udisks2` and a polkit agent — from your distro's packages. `pigz` (threaded
+`.tar.gz`) and `ntfs-3g` (NTFS repair) are optional.
+
+**The prebuilt binary needs glibc ≥ 2.39, GTK ≥ 4.12 and libadwaita ≥ 1.5** —
+Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, openSUSE Tumbleweed and their
+derivatives. On anything older, on musl (Alpine), or on a non-x86_64 machine,
+build from source instead.
+
+### From source
+
+Needs Rust 1.92+ and the development headers for the libraries above.
+
+```sh
+git clone https://github.com/0znio/fileman.git && cd fileman
 make            # cargo build --release
 make test
 make install    # to ~/.local — no root needed
 ```
 
 System-wide: `sudo make install PREFIX=/usr/local`. Run with `fileman [path]`.
-
-Dependencies, if you'd rather install them yourself: `gtk4`, `libadwaita`,
-`libarchive`, `udisks2` and a polkit agent at runtime; `pigz` for threaded
-`.tar.gz` and `ntfs-3g` for NTFS repair are optional.
 
 ## Shortcuts
 

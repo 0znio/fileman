@@ -76,13 +76,19 @@ done
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# One scratch directory for the whole run. Two functions each setting their own
-# EXIT trap would mean the second silently replaces the first and leaks its
-# directory.
+# One scratch directory for the whole run, in a variable rather than returned
+# from a function.
+#
+# `tmp=$(scratch)` would run the function in a subshell: the directory would be
+# created, the subshell would exit, and the EXIT trap registered inside it would
+# delete the directory before the caller ever wrote to it. Assigning $WORK
+# directly keeps both the variable and the trap in the shell that actually uses
+# them.
 WORK=""
-scratch() {
-    [ -n "$WORK" ] || { WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT INT TERM; }
-    echo "$WORK"
+ensure_scratch() {
+    [ -n "$WORK" ] && return 0
+    WORK=$(mktemp -d) || die "could not create a temporary directory"
+    trap 'rm -rf "$WORK"' EXIT INT TERM
 }
 
 # Returns success when $1 >= $2, comparing as dotted version numbers.
@@ -329,7 +335,7 @@ place() {   # place <binary> <desktop-file>
 # is a checksum mismatch, which is loud and fatal on purpose.
 install_binary() {
     say "Downloading the prebuilt binary"
-    tmp=$(scratch)
+    ensure_scratch; tmp="$WORK"
 
     if [ "$VERSION" = "latest" ]; then
         base="https://github.com/$REPO/releases/latest/download"
@@ -385,7 +391,7 @@ install_source() {
     gtk_is_new_enough || warn "GTK/libadwaita look older than $MIN_GTK/$MIN_ADW; the build may fail"
 
     say "Building from source (this takes a few minutes)"
-    tmp=$(scratch)
+    ensure_scratch; tmp="$WORK"
 
     if [ -f "./Cargo.toml" ] && [ -d "./src" ]; then
         src="."                                   # running inside a checkout

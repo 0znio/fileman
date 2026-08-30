@@ -722,6 +722,7 @@ fn validated_child(parent: &Path, name: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
 
     #[test]
     fn unique_destination_preserves_compound_extensions() {
@@ -782,8 +783,6 @@ mod tests {
         assert!(fs::symlink_metadata(dest.join("src/link")).unwrap().file_type().is_symlink());
         // The source is untouched by a copy.
         assert!(src.join("a.txt").exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -802,8 +801,6 @@ mod tests {
         assert!(outcome.errors.is_empty(), "unexpected errors: {:?}", outcome.errors);
         assert_eq!(fs::read(dest.join("move-me.txt")).unwrap(), b"payload");
         assert!(!file.exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -824,8 +821,6 @@ mod tests {
         assert!(outcome.errors.is_empty(), "unexpected errors: {:?}", outcome.errors);
         assert_eq!(fs::read(dest.join("dup.txt")).unwrap(), b"old");
         assert_eq!(fs::read(dest.join("dup (copy).txt")).unwrap(), b"new");
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -842,8 +837,6 @@ mod tests {
 
         assert_eq!(fs::read(dest.join("dup.txt")).unwrap(), b"old");
         assert!(!dest.join("dup (copy).txt").exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -858,8 +851,6 @@ mod tests {
 
         assert_eq!(outcome.errors.len(), 1);
         assert!(outcome.errors[0].1.contains("into itself"));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -873,19 +864,10 @@ mod tests {
 
         assert!(outcome.errors.is_empty(), "unexpected errors: {:?}", outcome.errors);
         assert!(!victim.exists());
-
-        fs::remove_dir_all(&root).ok();
     }
 
-    fn tempdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "fileman-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn tempdir() -> TempDir {
+        let p = TempDir::new("ops");
         fs::create_dir_all(&p).unwrap();
         p
     }

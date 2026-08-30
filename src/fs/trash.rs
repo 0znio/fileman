@@ -192,17 +192,11 @@ pub fn trash_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
 
     /// Builds a throwaway trash directory laid out per the freedesktop spec.
-    fn fake_trash() -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "fileman-trash-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn fake_trash() -> TempDir {
+        let root = TempDir::new("trash");
         fs::create_dir_all(root.join("files")).unwrap();
         fs::create_dir_all(root.join("info")).unwrap();
         root
@@ -228,8 +222,6 @@ mod tests {
         assert_eq!(item.deleted_at, "2026-01-02T03:04:05");
         assert_eq!(item.size, 3);
         assert!(!item.is_dir);
-
-        fs::remove_dir_all(&trash).ok();
     }
 
     #[test]
@@ -246,8 +238,6 @@ mod tests {
         assert!(
             parse_trashinfo(&trash.join("info/ghost.txt.trashinfo"), &trash.join("files")).is_none()
         );
-
-        fs::remove_dir_all(&trash).ok();
     }
 
     #[test]
@@ -272,7 +262,5 @@ mod tests {
 
         assert!(restore(&item).is_err());
         assert_eq!(fs::read(&original).unwrap(), b"the file that came back");
-
-        fs::remove_dir_all(&trash).ok();
     }
 }

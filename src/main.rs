@@ -6,6 +6,8 @@ mod config;
 mod drives;
 mod fs;
 mod history;
+#[cfg(test)]
+mod testing;
 mod trace;
 mod ui;
 

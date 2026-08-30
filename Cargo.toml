@@ -7,10 +7,10 @@ description = "A fast, modern GTK4/libadwaita file manager"
 license = "MIT"
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.11", features = ["v4_20"] }
-adw = { package = "libadwaita", version = "0.9", features = ["v1_9"] }
-gio = { version = "0.22", features = ["v2_84"] }
-glib = { version = "0.22", features = ["v2_84"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+gio = { version = "0.22", features = ["v2_74"] }
+glib = { version = "0.22", features = ["v2_74"] }
 gdk = { package = "gdk4", version = "0.11" }
 pango = "0.22"
 gdk-pixbuf = "0.22"

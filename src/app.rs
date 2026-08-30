@@ -42,7 +42,12 @@ pub fn run() -> glib::ExitCode {
         // the user is on. Inert unless the variable is set.
         if let Ok(target) = std::env::var("FILEMAN_SNAPSHOT") {
             let w = window.window.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(2500), move || {
+            // `FILEMAN_SNAPSHOT_DELAY_MS` buys time to arrange the window first.
+            let delay = std::env::var("FILEMAN_SNAPSHOT_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2500);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
                 use gtk::prelude::*;
                 let paintable = gtk::WidgetPaintable::new(Some(&w));
                 let snapshot = gtk::Snapshot::new();

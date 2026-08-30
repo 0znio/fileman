@@ -872,6 +872,14 @@ fn grid_factory(config: Rc<RefCell<Config>>) -> gtk::SignalListItemFactory {
             .css_classes(["caption"])
             .build();
 
+        // Pango hyphenates when it breaks a word across lines, which is right
+        // for prose and wrong for filenames: `backup-2026-08-30.tar.gz` came
+        // out as `backup-2026-08-30.t-` / `ar.gz`, inventing a hyphen that is
+        // not in the name.
+        let attrs = pango::AttrList::new();
+        attrs.insert(pango::AttrInt::new_insert_hyphens(false));
+        label.set_attributes(Some(&attrs));
+
         // `halign: Center` is what actually makes the caption truncate.
         //
         // GridView stretches its columns to fill the row, and a box that fills

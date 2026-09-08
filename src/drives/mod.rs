@@ -14,6 +14,7 @@ mod proxy;
 
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, Once},
@@ -22,7 +23,7 @@ use std::{
 use zbus::names::OwnedInterfaceName;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use proxy::{DriveProxyBlocking, FilesystemProxyBlocking};
+use proxy::{DriveProxyBlocking, EncryptedProxyBlocking, FilesystemProxyBlocking};
 
 const UDISKS_SERVICE: &str = "org.freedesktop.UDisks2";
 const IFACE_BLOCK: &str = "org.freedesktop.UDisks2.Block";
@@ -126,6 +127,9 @@ pub enum MountError {
     /// polkit denied or the user dismissed the prompt.
     NotAuthorized(String),
     AlreadyMounted(PathBuf),
+    /// The LUKS passphrase was rejected. Nothing was changed on the volume;
+    /// the user can simply try again.
+    WrongPassphrase,
     Other(String),
 }
 
@@ -135,6 +139,7 @@ impl MountError {
             MountError::NtfsUnclean { message, .. } => message.clone(),
             MountError::NotAuthorized(m) => m.clone(),
             MountError::AlreadyMounted(p) => format!("Already mounted at {}", p.display()),
+            MountError::WrongPassphrase => "That passphrase did not unlock the volume.".to_string(),
             MountError::Other(m) => m.clone(),
         }
     }
@@ -154,9 +159,12 @@ fn connection() -> Result<zbus::blocking::Connection, String> {
 }
 
 /// Reads the whole UDisks2 object tree and builds the sidebar's volume list.
-pub fn list_volumes() -> Result<Vec<Volume>, String> {
-    let conn = connection()?;
-    let manager = zbus::blocking::fdo::ObjectManagerProxy::builder(&conn)
+/// The whole UDisks2 device tree in one round-trip.
+type ManagedObjects =
+    HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, HashMap<String, OwnedValue>>>;
+
+fn managed_objects(conn: &zbus::blocking::Connection) -> Result<ManagedObjects, String> {
+    let manager = zbus::blocking::fdo::ObjectManagerProxy::builder(conn)
         .destination(UDISKS_SERVICE)
         .map_err(|e| e.to_string())?
         .path("/org/freedesktop/UDisks2")
@@ -164,9 +172,14 @@ pub fn list_volumes() -> Result<Vec<Volume>, String> {
         .build()
         .map_err(|e| format!("UDisks2 is not available: {e}"))?;
 
-    let objects = manager
+    manager
         .get_managed_objects()
-        .map_err(|e| format!("Could not query UDisks2: {e}"))?;
+        .map_err(|e| format!("Could not query UDisks2: {e}"))
+}
+
+pub fn list_volumes() -> Result<Vec<Volume>, String> {
+    let conn = connection()?;
+    let objects = managed_objects(&conn)?;
 
     // Drive interfaces are referenced by block devices, so index them first.
     let drives: HashMap<&OwnedObjectPath, &HashMap<String, OwnedValue>> = objects
@@ -369,6 +382,19 @@ fn decode_bytestring(bytes: &[u8]) -> Option<String> {
 
 // ── Mount operations ───────────────────────────────────────────────────────
 
+fn encrypted_proxy(
+    conn: &zbus::blocking::Connection,
+    object_path: &str,
+) -> Result<EncryptedProxyBlocking<'static>, String> {
+    EncryptedProxyBlocking::builder(conn)
+        .destination(UDISKS_SERVICE)
+        .map_err(|e| e.to_string())?
+        .path(object_path.to_string())
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 fn filesystem_proxy(
     conn: &zbus::blocking::Connection,
     object_path: &str,
@@ -395,24 +421,74 @@ fn filesystem_proxy(
 /// `ntfs-3g`, which mounts those same volumes read-write without complaint and
 /// without a password. So the fallback is tried automatically, before any
 /// dialog is put in front of the user.
-pub fn mount(volume: &Volume) -> Result<PathBuf, MountError> {
-    let first = mount_with_options(volume, &[]);
-    let Err(error) = first else {
-        return first;
-    };
+/// The `fstype` values to try, in order. An empty string means "let UDisks2
+/// choose", which is the in-kernel driver.
+///
+/// `ntfs-3g` reads volumes Windows left dirty; the in-kernel `ntfs3` refuses
+/// them outright but is markedly faster on the ones it accepts. So the kernel
+/// driver leads unless this particular volume has already proved it needs FUSE.
+fn mount_order(is_ntfs: bool, prefer_fuse: bool) -> &'static [&'static str] {
+    if is_ntfs && prefer_fuse {
+        &["ntfs-3g", ""]
+    } else {
+        &["", "ntfs-3g"]
+    }
+}
 
-    // Authentication failures and "already mounted" are not driver problems.
-    if !volume.is_ntfs() || matches!(error, MountError::NotAuthorized(_) | MountError::AlreadyMounted(_)) {
-        return Err(error);
+/// Where a mount ended up, and which driver got it there.
+///
+/// `used_fuse` is fed back into the config so the next mount of the same volume
+/// can skip straight to the driver that worked.
+pub struct Mounted {
+    pub path: PathBuf,
+    pub used_fuse: bool,
+}
+
+/// Mounts `volume`, trying the FUSE driver first when asked.
+///
+/// The order matters for more than speed. Every mount attempt — including a
+/// failed one — is a UDisks2 job, and other things on the desktop listen to
+/// those: `udiskie` pops a "Job failed" notification for the first attempt even
+/// when the retry immediately succeeds, so a working mount still looks broken.
+/// Getting it right first time is the only way to keep that quiet.
+///
+/// `prefer_fuse` is remembered per volume by the caller, so a drive that needed
+/// `ntfs-3g` once goes straight there afterwards and the in-kernel driver stays
+/// the fast default for volumes that can use it.
+pub fn mount(volume: &Volume, prefer_fuse: bool) -> Result<Mounted, MountError> {
+    let order = mount_order(volume.is_ntfs(), prefer_fuse);
+
+    let mut first_error: Option<MountError> = None;
+
+    for (index, fstype) in order.iter().enumerate() {
+        let options: Vec<(&str, &str)> =
+            if fstype.is_empty() { Vec::new() } else { vec![("fstype", *fstype)] };
+
+        match mount_with_options(volume, &options) {
+            Ok(path) => return Ok(Mounted { path, used_fuse: !fstype.is_empty() }),
+            Err(error) => {
+                // Neither of these is a driver problem, and retrying with a
+                // different one would only produce a second identical failure.
+                if matches!(
+                    error,
+                    MountError::NotAuthorized(_) | MountError::AlreadyMounted(_)
+                ) {
+                    return Err(error);
+                }
+                // Only NTFS has a second driver worth trying.
+                if !volume.is_ntfs() {
+                    return Err(error);
+                }
+                if index == 0 {
+                    first_error = Some(error);
+                }
+            }
+        }
     }
 
-    match mount_with_options(volume, &[("fstype", "ntfs")]) {
-        Ok(path) => Ok(path),
-        // Report the *first* error: it describes the volume, whereas the
-        // fallback's is usually just a repeat.
-        Err(MountError::Other(_)) => Err(error),
-        Err(second) => Err(second),
-    }
+    // Report the first failure: it describes the volume, where the fallback's
+    // is usually just a repeat from a driver we merely guessed at.
+    Err(first_error.unwrap_or_else(|| MountError::Other("Could not mount the volume".into())))
 }
 
 /// Mounts read-only — the safe answer when Windows is hibernated.
@@ -451,14 +527,154 @@ fn mount_with_options(volume: &Volume, options: &[(&str, &str)]) -> Result<PathB
     }
 }
 
+/// Unlocks a LUKS container and mounts the filesystem inside it.
+///
+/// Two steps, because they are two different objects: `Unlock` opens a
+/// device-mapper mapping and hands back the *cleartext* device, and that is
+/// what carries the filesystem to mount. Neither step writes to the LUKS
+/// header, so a wrong passphrase costs nothing but an error.
+///
+/// The passphrase is moved in and dropped with this call; it is never stored,
+/// logged, or written to the config.
+pub fn unlock_and_mount(
+    volume: &Volume,
+    passphrase: &str,
+    prefer_fuse: bool,
+) -> Result<Mounted, MountError> {
+    let conn = connection().map_err(MountError::Other)?;
+
+    let cleartext = match unlock(&conn, volume, passphrase) {
+        Ok(path) => path,
+        // Already open from an earlier unlock, or unlocked by something else:
+        // find the mapping that is already there rather than failing.
+        Err(MountError::AlreadyMounted(_)) => cleartext_device_of(volume)
+            .ok_or_else(|| MountError::Other("The volume is unlocked but its contents could not be found.".into()))?,
+        Err(other) => return Err(other),
+    };
+
+    let mut opened = volume.clone();
+    opened.object_path = cleartext;
+    opened.is_encrypted = false;
+    opened.mount_point = None;
+    mount(&opened, prefer_fuse)
+}
+
+fn unlock(
+    conn: &zbus::blocking::Connection,
+    volume: &Volume,
+    passphrase: &str,
+) -> Result<String, MountError> {
+    let proxy = encrypted_proxy(conn, &volume.object_path).map_err(MountError::Other)?;
+
+    let mut opts: HashMap<&str, Value> = HashMap::new();
+    opts.insert("auth.no_user_interaction", Value::from(false));
+
+    match proxy.unlock(passphrase, opts) {
+        Ok(path) => Ok(path.as_str().to_string()),
+        Err(err) => Err(classify_unlock_error(&err.to_string())),
+    }
+}
+
+/// The cleartext device already backed by `volume`, if the container is open.
+fn cleartext_device_of(volume: &Volume) -> Option<String> {
+    let conn = connection().ok()?;
+    let objects = managed_objects(&conn).ok()?;
+
+    objects.iter().find_map(|(path, ifaces)| {
+        let block = iface(ifaces, IFACE_BLOCK)?;
+        let backing = get_object_path(block, "CryptoBackingDevice")?;
+        (backing == volume.object_path).then(|| path.as_str().to_string())
+    })
+}
+
+/// Distinguishes a wrong passphrase from every other reason an unlock fails,
+/// because it is the only one the user can do anything about.
+fn classify_unlock_error(raw: &str) -> MountError {
+    let lower = raw.to_lowercase();
+
+    if lower.contains("already unlocked") || lower.contains("already exists") {
+        return MountError::AlreadyMounted(PathBuf::new());
+    }
+    if lower.contains("not authorized") || lower.contains("dismissed") {
+        return MountError::NotAuthorized(
+            "Authentication is required to unlock this drive.".to_string(),
+        );
+    }
+    // cryptsetup reports a bad passphrase as "no key available with this
+    // passphrase"; udisks wraps it, so match on the substance rather than the
+    // exact wrapper.
+    if lower.contains("no key available")
+        || lower.contains("failed to activate")
+        || lower.contains("incorrect passphrase")
+        || lower.contains("wrong passphrase")
+    {
+        return MountError::WrongPassphrase;
+    }
+    MountError::Other(raw.to_string())
+}
+
+/// Shown when the mount needs authorisation and nothing can ask for it.
+const NO_AGENT_MESSAGE: &str = "This drive needs your password to mount, but no \
+authentication agent is running, so nothing can ask for it.\n\n\
+Desktop environments start one automatically; a bare window manager usually \
+does not. Start one and try again — on Hyprland:\n\n\
+    systemctl --user start hyprpolkitagent\n\n\
+Add it to your session's autostart to make it permanent.";
+
+/// Whether a polkit authentication agent is registered for this session.
+///
+/// polkit has no API to ask this directly, so the agents themselves are looked
+/// for: they are long-lived processes with recognisable names, and every
+/// desktop ships one of them. Used only to choose the wording of an error, so a
+/// wrong guess costs nothing worse than a less helpful message.
+fn authentication_agent_running() -> bool {
+    const AGENTS: &[&str] = &[
+        "polkit-gnome-authentication-agent",
+        "polkit-kde-authentication-agent",
+        "polkit-mate-authentication-agent",
+        "hyprpolkitagent",
+        "lxpolkit",
+        "lxqt-policykit-agent",
+        "xfce-polkit",
+        "polkit-dumb-agent",
+        "soteria",
+    ];
+
+    let Ok(entries) = fs::read_dir("/proc") else { return false };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(comm) = fs::read_to_string(entry.path().join("comm")) else { continue };
+        let comm = comm.trim();
+        if AGENTS.iter().any(|agent| agent.starts_with(comm) || comm.starts_with(agent)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Maps a raw UDisks2 error string onto an actionable [`MountError`].
 fn classify_mount_error(raw: &str, volume: &Volume) -> MountError {
     let lower = raw.to_lowercase();
 
+    // `NotAuthorizedCanObtain` is polkit saying "no, *but* asking would have
+    // worked". Mounting an internal partition needs the
+    // `filesystem-mount-system` action, whose policy is `auth_admin`, so this is
+    // the normal answer — and if no authentication agent is registered for the
+    // session there is nothing to show the prompt, and the mount fails
+    // instantly with no way for the user to say yes. That is a very different
+    // problem from a flat refusal, so it gets a different message.
+    if lower.contains("notauthorizedcanobtain") {
+        return MountError::NotAuthorized(if authentication_agent_running() {
+            "Authentication was not completed.".to_string()
+        } else {
+            NO_AGENT_MESSAGE.to_string()
+        });
+    }
     if lower.contains("not authorized") || lower.contains("dismissed") {
-        return MountError::NotAuthorized(
-            "Authentication is required to mount this drive.".to_string(),
-        );
+        return MountError::NotAuthorized(if authentication_agent_running() {
+            "Authentication is required to mount this drive.".to_string()
+        } else {
+            NO_AGENT_MESSAGE.to_string()
+        });
     }
 
     if volume.is_ntfs() || lower.contains("ntfs") {
@@ -540,7 +756,7 @@ fn which(binary: &str) -> Option<PathBuf> {
 /// This is the non-destructive repair: it resets the volume's dirty bit and
 /// schedules Windows' own chkdsk for the next boot. It does not touch a
 /// hibernation image — [`force_mount`] is for that.
-pub fn repair_and_mount(volume: &Volume) -> Result<PathBuf, MountError> {
+pub fn repair_and_mount(volume: &Volume) -> Result<Mounted, MountError> {
     let ntfsfix = which("ntfsfix")
         .ok_or_else(|| MountError::Other(
             "ntfsfix is not installed. On Arch it comes from the ntfsprogs package."
@@ -569,7 +785,7 @@ pub fn repair_and_mount(volume: &Volume) -> Result<PathBuf, MountError> {
 
     // Re-read the volume so the retry sees UDisks2's current mount state.
     let refreshed = refresh(volume).unwrap_or_else(|| volume.clone());
-    mount(&refreshed)
+    mount(&refreshed, false)
 }
 
 /// Mounts NTFS read-write by discarding the hibernation image.
@@ -736,3 +952,36 @@ fn start_watch_thread() -> Result<(), String> {
 
     Ok(())
 }
+
+
+
+#[cfg(test)]
+mod mount_order_tests {
+    use super::mount_order;
+
+    /// The attempt order is the whole point: getting it right first time is
+    /// what stops a failed UDisks2 job appearing, which other desktop
+    /// components report as an error even when the retry succeeds.
+    #[test]
+    fn a_remembered_volume_tries_the_fuse_driver_first() {
+        assert_eq!(mount_order(true, true), ["ntfs-3g", ""], "remembered NTFS goes to FUSE first");
+        assert_eq!(mount_order(true, false), ["", "ntfs-3g"], "unknown NTFS tries the kernel first");
+        assert_eq!(mount_order(false, true), ["", "ntfs-3g"], "non-NTFS never prefers FUSE");
+        assert_eq!(mount_order(false, false), ["", "ntfs-3g"]);
+    }
+
+    /// Both drivers are always reachable, whichever way round they are tried —
+    /// a volume must never be left with only one option.
+    #[test]
+    fn every_order_still_offers_both_drivers() {
+        for is_ntfs in [true, false] {
+            for prefer in [true, false] {
+                let order = mount_order(is_ntfs, prefer);
+                assert_eq!(order.len(), 2);
+                assert!(order.contains(&""), "the kernel driver must stay reachable");
+                assert!(order.contains(&"ntfs-3g"), "the FUSE driver must stay reachable");
+            }
+        }
+    }
+}
+

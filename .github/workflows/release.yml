@@ -62,6 +62,7 @@ jobs:
           cp README.md LICENSE "dist/$DIR/"
           mkdir -p "dist/$DIR/share/applications"
           cp data/dev.fileman.Files.desktop "dist/$DIR/share/applications/"
+          cp -r data/icons "dist/$DIR/share/"
           printf 'glibc>=%s\ngtk4>=4.12\nlibadwaita>=1.5\n' \
             "${{ steps.reqs.outputs.glibc }}" > "dist/$DIR/REQUIREMENTS"
           tar -C dist -czf "dist/$DIR.tar.gz" "$DIR"

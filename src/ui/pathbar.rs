@@ -77,6 +77,11 @@ impl PathBar {
             .css_classes(["path-entry"])
             .build();
         entry.set_primary_icon_name(Some("folder-symbolic"));
+        // An explicit way to take the path, so copying it does not depend on
+        // knowing that Ctrl+C means something different here than in the grid.
+        entry.set_icon_from_icon_name(gtk::EntryIconPosition::Secondary, Some("edit-copy-symbolic"));
+        entry.set_icon_tooltip_text(gtk::EntryIconPosition::Secondary, Some("Copy path"));
+        entry.set_icon_activatable(gtk::EntryIconPosition::Secondary, true);
 
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
@@ -186,14 +191,50 @@ impl PathBar {
         });
         self.entry.add_controller(keys);
 
+        // Collapsing back to crumbs the instant focus leaves also fired when
+        // focus moved to the entry's own right-click menu — so reaching for
+        // "Copy" tore down the thing you were copying from. Deferring the
+        // decision by one main-loop turn lets that transient focus settle, and
+        // the entry stays put if it, or anything inside it, still has focus.
         let focus = gtk::EventControllerFocus::new();
         let weak = Rc::downgrade(self);
         focus.connect_leave(move |_| {
-            if let Some(this) = weak.upgrade() {
+            let weak = weak.clone();
+            glib::idle_add_local_once(move || {
+                let Some(this) = weak.upgrade() else { return };
+                if this.entry.has_focus() || this.entry.focus_child().is_some() {
+                    return;
+                }
                 this.show_crumbs();
-            }
+            });
         });
         self.entry.add_controller(focus);
+
+        let weak = Rc::downgrade(self);
+        self.entry.connect_icon_release(move |entry, position| {
+            if position != gtk::EntryIconPosition::Secondary {
+                return;
+            }
+            let Some(this) = weak.upgrade() else { return };
+            entry.clipboard().set_text(&entry.text());
+            this.flash_copied(entry);
+        });
+    }
+
+    /// Confirms a copy by swapping the icon briefly, since the clipboard gives
+    /// no other sign that anything happened.
+    fn flash_copied(self: &Rc<Self>, entry: &gtk::Entry) {
+        entry.set_icon_from_icon_name(
+            gtk::EntryIconPosition::Secondary,
+            Some("object-select-symbolic"),
+        );
+        let entry = entry.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(900), move || {
+            entry.set_icon_from_icon_name(
+                gtk::EntryIconPosition::Secondary,
+                Some("edit-copy-symbolic"),
+            );
+        });
     }
 
     /// Switches to the editable path, selected so typing replaces it.

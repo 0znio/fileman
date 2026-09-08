@@ -17,6 +17,7 @@ set -eu
 REPO="0znio/fileman"
 APP="fileman"
 DESKTOP="dev.fileman.Files.desktop"
+APP_ICON="dev.fileman.Files"
 
 # Minimums the source actually requires — see Cargo.toml's feature flags.
 MIN_GTK="4.12"
@@ -143,11 +144,24 @@ needs_root_for() {
 if needs_root_for "$PREFIX"; then NEEDS_ROOT="yes"; else NEEDS_ROOT="no"; fi
 maybe_root() { if [ "$NEEDS_ROOT" = "yes" ]; then as_root "$@"; else "$@"; fi; }
 
+# ── install paths ───────────────────────────────────────────────────────────
+# Defined before the uninstall branch below, which removes the very files these
+# name; leaving them further down meant `--uninstall` aborted on an unbound
+# variable under `set -u`.
+BINDIR="$PREFIX/bin"
+APPDIR="$PREFIX/share/applications"
+ICONDIR="$PREFIX/share/icons/hicolor"
+ICON_SIZES="16 24 32 48 64 128 256 512"
+
 # ── uninstall ───────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = "yes" ]; then
     say "Removing $APP from $PREFIX"
     maybe_root rm -f "$PREFIX/bin/$APP" "$PREFIX/share/applications/$DESKTOP"
+    for size in $ICON_SIZES; do
+        maybe_root rm -f "$ICONDIR/${size}x${size}/apps/$APP_ICON.png"
+    done
     maybe_root update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
+    maybe_root gtk-update-icon-cache -qtf "$ICONDIR" 2>/dev/null || true
     ok "removed (config in ~/.config/fileman was left alone)"
     exit 0
 fi
@@ -321,12 +335,33 @@ gtk_is_new_enough() {
 }
 
 # ── install paths ───────────────────────────────────────────────────────────
-BINDIR="$PREFIX/bin"
-APPDIR="$PREFIX/share/applications"
-
-place() {   # place <binary> <desktop-file>
+place() {   # place <binary> <desktop-file> <icon-root>
     maybe_root install -Dm755 "$1" "$BINDIR/$APP"
-    maybe_root install -Dm644 "$2" "$APPDIR/$DESKTOP"
+
+    # `Exec=fileman` needs the binary on PATH, and a desktop session's PATH is
+    # not the shell's: `~/.local/bin` is absent from it on many setups, so the
+    # launcher silently does nothing while running it in a terminal works. Bake
+    # in the real path, and add TryExec so a launcher hides a broken entry
+    # rather than offering one that fails.
+    maybe_root install -d "$APPDIR"
+    ensure_scratch
+    sed -e "s|^Exec=$APP|Exec=$BINDIR/$APP|" \
+        -e "s|^Icon=|TryExec=$BINDIR/$APP\\nIcon=|" \
+        "$2" > "$WORK/$DESKTOP"
+    maybe_root install -m644 "$WORK/$DESKTOP" "$APPDIR/$DESKTOP"
+
+    # Without the icon the desktop entry falls back to a generic glyph, so the
+    # app looks unfinished in every launcher and task switcher.
+    if [ -n "${3:-}" ] && [ -d "$3" ]; then
+        for size in $ICON_SIZES; do
+            src="$3/hicolor/${size}x${size}/apps/$APP_ICON.png"
+            [ -f "$src" ] || continue
+            maybe_root install -Dm644 "$src" \
+                "$ICONDIR/${size}x${size}/apps/$APP_ICON.png"
+        done
+        maybe_root gtk-update-icon-cache -qtf "$ICONDIR" 2>/dev/null || true
+    fi
+
     maybe_root update-desktop-database "$APPDIR" 2>/dev/null || true
 }
 
@@ -383,7 +418,7 @@ install_binary() {
         warn "the downloaded binary does not run on this system"
         return 1
     fi
-    place "$dir/$APP" "$dir/share/applications/$DESKTOP"
+    place "$dir/$APP" "$dir/share/applications/$DESKTOP" "$dir/share/icons"
 }
 
 install_source() {
@@ -409,7 +444,7 @@ install_source() {
     fi
 
     ( cd "$src" && cargo build --release --locked ) || die "build failed"
-    place "$src/target/release/$APP" "$src/data/$DESKTOP"
+    place "$src/target/release/$APP" "$src/data/$DESKTOP" "$src/data/icons"
 }
 
 # ── go ──────────────────────────────────────────────────────────────────────

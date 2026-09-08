@@ -42,6 +42,9 @@ fn emit_unit(slot: &RefCell<Option<Rc<dyn Fn()>>>) {
 enum Target {
     Path(PathBuf),
     Trash,
+    Recent,
+    /// Mounted network shares, which gvfs bridges into the filesystem.
+    Network,
     Volume(Box<Volume>),
 }
 
@@ -58,6 +61,7 @@ pub struct Sidebar {
 
     on_navigate: Callback<PathBuf>,
     on_open_trash: RefCell<Option<Rc<dyn Fn()>>>,
+    on_open_recent: RefCell<Option<Rc<dyn Fn()>>>,
     on_mount: Callback<Volume>,
     on_unmount: Callback<Volume>,
     on_eject: Callback<Volume>,
@@ -91,6 +95,7 @@ impl Sidebar {
             trash_count: RefCell::new(0),
             on_navigate: RefCell::new(None),
             on_open_trash: RefCell::new(None),
+            on_open_recent: RefCell::new(None),
             on_mount: RefCell::new(None),
             on_unmount: RefCell::new(None),
             on_eject: RefCell::new(None),
@@ -109,6 +114,9 @@ impl Sidebar {
     }
     pub fn connect_open_trash(&self, f: impl Fn() + 'static) {
         *self.on_open_trash.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_open_recent(&self, f: impl Fn() + 'static) {
+        *self.on_open_recent.borrow_mut() = Some(Rc::new(f));
     }
     pub fn connect_mount(&self, f: impl Fn(Volume) + 'static) {
         *self.on_mount.borrow_mut() = Some(Rc::new(f));
@@ -154,7 +162,11 @@ impl Sidebar {
             let active = match target {
                 Target::Path(p) => p == path,
                 Target::Volume(v) => v.mount_point.as_deref() == Some(path),
-                Target::Trash => false,
+                // Network resolves to a real directory, so it highlights like
+                // any other path; Trash and Recent have none and are selected
+                // by the window instead.
+                Target::Network => crate::fs::recent::network_root().as_deref() == Some(path),
+                Target::Trash | Target::Recent => false,
             };
             let Some(list) = row.parent().and_downcast::<gtk::ListBox>() else { continue };
             if active {
@@ -177,20 +189,58 @@ impl Sidebar {
 
         self.build_places();
         self.build_favourites();
+        self.build_system();
         self.build_devices();
 
         let current = self.current.borrow().clone();
         self.set_current(&current);
     }
 
+    /// The folders that live in the user's home.
+    ///
+    /// Split from the virtual locations below because they are a different kind
+    /// of thing: real directories you own, as against views the system
+    /// assembles. Running the two together in one unlabelled list was the
+    /// sidebar's least legible part.
     fn build_places(self: &Rc<Self>) {
-        let list = self.new_section(None);
+        let list = self.new_section(Some("Places"));
 
         for (label, path, icon) in crate::fs::scan::xdg_places() {
             let row = self.make_row(&label, icon, None, Target::Path(path.clone()));
             self.attach_folder_drop(&row, &path);
             list.append(&row);
         }
+    }
+
+    /// Locations the system assembles rather than ones that sit on disk.
+    fn build_system(self: &Rc<Self>) {
+        let list = self.new_section(Some("System"));
+
+        let recent = self.make_row(
+            "Recent",
+            "document-open-recent-symbolic",
+            None,
+            Target::Recent,
+        );
+        list.append(&recent);
+
+        let network = self.make_row("Network", "network-workgroup-symbolic", None, Target::Network);
+        // Say up front when there is nothing behind it, rather than opening an
+        // empty folder and leaving the user to guess why.
+        match crate::fs::recent::network_root() {
+            Some(root) if !crate::fs::recent::network_is_empty(&root) => {
+                network.set_tooltip_text(Some("Network shares mounted in this session"));
+            }
+            Some(_) => network
+                .set_tooltip_text(Some("No network shares are mounted yet")),
+            None => {
+                network.set_sensitive(false);
+                network.set_tooltip_text(Some(
+                    "Needs gvfs, which provides network browsing for the desktop",
+                ));
+            }
+        }
+        list.append(&network);
 
         let count = *self.trash_count.borrow();
         let badge = (count > 0).then(|| count.to_string());
@@ -297,6 +347,17 @@ impl Sidebar {
             Some(Target::Path(path)) => self.navigate(path),
             Some(Target::Trash) => {
                 emit_unit(&self.on_open_trash);
+            }
+            Some(Target::Recent) => {
+                emit_unit(&self.on_open_recent);
+            }
+            // The row is insensitive without gvfs, so a missing root here only
+            // happens if the bridge stopped between building the row and the
+            // click; doing nothing is the right response either way.
+            Some(Target::Network) => {
+                if let Some(root) = crate::fs::recent::network_root() {
+                    self.navigate(root);
+                }
             }
             Some(Target::Volume(volume)) => match &volume.mount_point {
                 // Already mounted: just go there.
@@ -466,32 +527,27 @@ impl Sidebar {
         content.append(&text);
 
         if volume.is_mounted() {
-            let icon = if volume.ejectable || volume.can_power_off {
-                "media-eject-symbolic"
-            } else {
-                "media-playback-stop-symbolic"
-            };
+            // Always unmount, never eject.
+            //
+            // This button used to eject whenever the drive could be powered
+            // off, which is true of every USB disk — so the one obvious control
+            // next to a plugged-in SSD cut power to it and the drive
+            // disappeared from the system entirely until it was physically
+            // replugged. Unmounting is the reversible, everyday action and is
+            // what a single click should do; ejecting is a deliberate "I am
+            // about to unplug this" and lives in the right-click menu, named.
             let button = gtk::Button::builder()
-                .icon_name(icon)
+                .icon_name("media-playback-stop-symbolic")
                 .css_classes(["flat", "circular"])
                 .valign(gtk::Align::Center)
-                .tooltip_text(if volume.ejectable || volume.can_power_off {
-                    "Eject"
-                } else {
-                    "Unmount"
-                })
+                .tooltip_text("Unmount")
                 .build();
 
             let weak = Rc::downgrade(self);
             let volume_for_button = volume.clone();
             button.connect_clicked(move |_| {
                 let Some(this) = weak.upgrade() else { return };
-                let handler = if volume_for_button.ejectable || volume_for_button.can_power_off {
-                    &this.on_eject
-                } else {
-                    &this.on_unmount
-                };
-                emit(handler, volume_for_button.clone());
+                emit(&this.on_unmount, volume_for_button.clone());
             });
             content.append(&button);
         }
@@ -545,7 +601,9 @@ impl Sidebar {
             menu.append(Some("Open"), Some("volume.open"));
             menu.append(Some("Unmount"), Some("volume.unmount"));
             if volume.ejectable || volume.can_power_off {
-                menu.append(Some("Eject Safely"), Some("volume.eject"));
+                // Named for what it does: this powers the drive down, and it
+                // will not reappear until it is unplugged and plugged back in.
+                menu.append(Some("Eject — safe to unplug"), Some("volume.eject"));
             }
         } else {
             menu.append(Some("Mount"), Some("volume.mount"));

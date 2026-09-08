@@ -65,7 +65,13 @@ fn build_single(page: &adw::PreferencesPage, entry: &FileEntry, stop: &Arc<Atomi
         .wrap(true)
         .wrap_mode(pango::WrapMode::WordChar)
         .justify(gtk::Justification::Center)
+        // Selectable so the name can be copied, but kept out of the focus
+        // chain: a selectable label is focusable, and being the first such
+        // widget in the dialog it took focus on open and showed the whole name
+        // highlighted, as though something were already selected. Dragging
+        // across it still selects.
         .selectable(true)
+        .can_focus(false)
         .css_classes(["title-2"])
         .build();
 

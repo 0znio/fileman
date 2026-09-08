@@ -1,3 +1,4 @@
+pub mod accent;
 pub mod actions;
 pub mod dialogs;
 pub mod file_object;

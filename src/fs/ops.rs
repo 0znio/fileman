@@ -49,6 +49,7 @@ pub enum JobKind {
     Delete,
     Trash,
     Shred,
+    Download,
 }
 
 impl JobKind {
@@ -59,6 +60,7 @@ impl JobKind {
             JobKind::Delete => "Deleting",
             JobKind::Trash => "Moving to Trash",
             JobKind::Shred => "Shredding",
+            JobKind::Download => "Downloading",
         }
     }
 }

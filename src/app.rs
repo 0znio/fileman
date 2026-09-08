@@ -43,7 +43,10 @@ pub fn run() -> glib::ExitCode {
     crate::trace::init();
 
     app.connect_startup(|_| {
-        load_stylesheet();
+        // Names the icon the desktop entry installs, so the window carries it
+        // in task switchers and docks as well as in launchers.
+        gtk::Window::set_default_icon_name(APP_ID);
+        load_stylesheet(&Config::load().accent_color);
         crate::trace::install_stall_detector();
     });
 
@@ -68,7 +71,28 @@ pub fn run() -> glib::ExitCode {
             let delay = std::env::var("FILEMAN_SNAPSHOT_DELAY_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2500);
+                .unwrap_or(2500u64);
+            // `FILEMAN_SNAPSHOT_ACTIONS=select-all,properties` fires window
+            // actions before the shot, so dialogs can be captured too.
+            let actions: Vec<String> = std::env::var("FILEMAN_SNAPSHOT_ACTIONS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .collect();
+            if !actions.is_empty() {
+                let w = w.clone();
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(delay.saturating_sub(700)),
+                    move || {
+                        use gtk::prelude::*;
+                        for action in actions {
+                            let _ = WidgetExt::activate_action(&w, &format!("win.{action}"), None);
+                        }
+                    },
+                );
+            }
+
             glib::timeout_add_local_once(std::time::Duration::from_millis(delay), move || {
                 use gtk::prelude::*;
                 let paintable = gtk::WidgetPaintable::new(Some(&w));
@@ -130,16 +154,33 @@ fn starting_directory(command_line: &gio::ApplicationCommandLine) -> PathBuf {
     path.parent().filter(|p| p.is_dir()).map(|p| p.to_path_buf()).unwrap_or_else(home)
 }
 
-fn load_stylesheet() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(include_str!("ui/style.css"));
+/// Installs the stylesheet with `accent` substituted in.
+///
+/// Calling it again replaces the previous provider, so changing the accent in
+/// Settings restyles the running window without a restart.
+pub fn load_stylesheet(accent: &str) {
+    use std::cell::RefCell;
+    thread_local! {
+        /// Kept so the old provider can be removed; adding a second one would
+        /// leave both in the cascade and make the winner depend on order.
+        static CURRENT: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    }
 
     let Some(display) = gdk::Display::default() else { return };
-    gtk::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        // Above the theme so our rules win, below user overrides in
-        // ~/.config/gtk-4.0/gtk.css so the user still has the last word.
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+
+    CURRENT.with(|current| {
+        if let Some(old) = current.borrow_mut().take() {
+            gtk::style_context_remove_provider_for_display(&display, &old);
+        }
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(&crate::ui::accent::apply(include_str!("ui/style.css"), accent));
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            // Above the theme so our rules win, below user overrides in
+            // ~/.config/gtk-4.0/gtk.css so the user still has the last word.
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        *current.borrow_mut() = Some(provider);
+    });
 }

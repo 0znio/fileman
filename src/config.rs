@@ -73,6 +73,14 @@ pub struct Config {
     /// Threads long-running jobs may use. `0` sizes automatically, leaving
     /// about half the machine's cores free for everything else.
     pub worker_threads: u32,
+    /// Accent colour as `#RRGGBB`, driving selection, focus and the meters.
+    pub accent_color: String,
+    /// UUIDs of NTFS volumes that only mount through `ntfs-3g`.
+    ///
+    /// Remembered so the next mount goes straight to the driver that worked.
+    /// The first attempt on a dirty volume is a failed UDisks2 job, and other
+    /// desktop components report those as errors even when the retry succeeds.
+    pub ntfs_fuse_volumes: Vec<String>,
     pub confirm_trash: bool,
     pub show_thumbnails: bool,
     /// Files above this size are never thumbnailed (bytes).
@@ -97,6 +105,8 @@ impl Default for Config {
             single_click_open: false,
             shred_passes: 3,
             worker_threads: 0,
+            accent_color: crate::ui::accent::DEFAULT.to_string(),
+            ntfs_fuse_volumes: Vec::new(),
             confirm_trash: false,
             show_thumbnails: true,
             thumbnail_max_bytes: 32 * 1024 * 1024,
@@ -149,6 +159,10 @@ impl Config {
         }
         self.shred_passes = self.shred_passes.clamp(1, 35);
         self.worker_threads = self.worker_threads.min(64);
+        self.accent_color = crate::ui::accent::normalise(&self.accent_color);
+        self.ntfs_fuse_volumes.retain(|uuid| !uuid.is_empty());
+        self.ntfs_fuse_volumes.sort();
+        self.ntfs_fuse_volumes.dedup();
         self.window_width = self.window_width.max(480);
         self.window_height = self.window_height.max(360);
         self.favourites.retain(|p| p.is_absolute());

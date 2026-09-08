@@ -473,18 +473,39 @@ impl FileView {
         });
         widget.add_controller(gesture);
 
-        // Shift+F10 / the Menu key open the same menu for keyboard users.
+        // Keys that act on the selection live here rather than as window
+        // accelerators.
+        //
+        // GTK dispatches a window accelerator before the focused widget sees the
+        // key, so binding bare `Delete` and `BackSpace` at the window meant they
+        // never reached a text entry: correcting a search query fired "move to
+        // Trash" on every keystroke, and with nothing selected the user got a
+        // "Select something to delete" toast for each one. Scoped to the view,
+        // they do the file-manager thing when the files have focus and edit text
+        // when a text box does.
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, state| {
             let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
-            let menu_key = key == gdk::Key::Menu
-                || (key == gdk::Key::F10 && state.contains(gdk::ModifierType::SHIFT_MASK));
-            if !menu_key {
-                return glib::Propagation::Proceed;
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+
+            if key == gdk::Key::Menu || (key == gdk::Key::F10 && shift) {
+                // Anchor to the top-left of the visible view for keyboard use.
+                emit(&this.on_context_menu, (8.0, 8.0));
+                return glib::Propagation::Stop;
             }
-            // Anchor to the top-left of the visible view for keyboard use.
-            emit(&this.on_context_menu, (8.0, 8.0));
+
+            let action = match key {
+                gdk::Key::Delete | gdk::Key::KP_Delete if ctrl && shift => "win.shred",
+                gdk::Key::Delete | gdk::Key::KP_Delete if shift => "win.delete-permanently",
+                gdk::Key::Delete | gdk::Key::KP_Delete | gdk::Key::BackSpace => "win.trash",
+                gdk::Key::F2 => "win.rename",
+                _ => return glib::Propagation::Proceed,
+            };
+
+            // Actions live on the window; lookup walks up from here.
+            let _ = WidgetExt::activate_action(&this.stack, action, None);
             glib::Propagation::Stop
         });
         widget.add_controller(keys);

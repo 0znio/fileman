@@ -29,13 +29,16 @@ use crate::{
 pub enum Location {
     Directory(PathBuf),
     Trash,
+    /// The freedesktop recent-files list, assembled from paths that still
+    /// exist. Has no directory of its own, so it cannot be pasted into.
+    Recent,
 }
 
 impl Location {
     pub fn as_path(&self) -> Option<&Path> {
         match self {
             Location::Directory(p) => Some(p),
-            Location::Trash => None,
+            Location::Trash | Location::Recent => None,
         }
     }
 }
@@ -47,12 +50,60 @@ pub struct Clip {
     pub is_cut: bool,
 }
 
+/// Everything that belongs to one tab.
+///
+/// A tab is a place you are looking at, so it owns the view showing it, the
+/// history that got you there, and the scan feeding it. The window keeps only
+/// the chrome around them — path bar, sidebar, job strip — which is shared and
+/// always reflects whichever tab is in front.
+pub(crate) struct Tab {
+    pub(crate) view: Rc<FileView>,
+    pub(crate) history: RefCell<History>,
+    pub(crate) location: RefCell<Location>,
+    /// Entries currently loaded, kept so actions can work on the selection
+    /// without re-querying the filesystem.
+    pub(crate) entries: RefCell<Vec<FileEntry>>,
+    /// Bumped on every navigation so a slow scan can detect it was superseded.
+    pub(crate) scan_generation: Cell<u64>,
+    pub(crate) scan_cancellable: RefCell<gio::Cancellable>,
+    pub(crate) dir_monitor: RefCell<Option<gio::FileMonitor>>,
+}
+
+impl Tab {
+    fn new(config: &Rc<RefCell<Config>>, start: PathBuf) -> Rc<Self> {
+        Rc::new(Self {
+            view: FileView::new(Rc::clone(config)),
+            history: RefCell::new(History::new(start.clone())),
+            location: RefCell::new(Location::Directory(start)),
+            entries: RefCell::new(Vec::new()),
+            scan_generation: Cell::new(0),
+            scan_cancellable: RefCell::new(gio::Cancellable::new()),
+            dir_monitor: RefCell::new(None),
+        })
+    }
+
+    /// A short label for the tab strip.
+    fn title(&self) -> String {
+        match &*self.location.borrow() {
+            Location::Trash => "Trash".to_string(),
+            Location::Recent => "Recent".to_string(),
+            Location::Directory(path) => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                // The root and a home directory both have names worth showing
+                // rather than an empty tab.
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        }
+    }
+}
+
 pub struct Window {
     pub(crate) window: adw::ApplicationWindow,
     pub(crate) app: adw::Application,
     pub(crate) config: Rc<RefCell<Config>>,
 
-    pub(crate) view: Rc<FileView>,
+    pub(crate) tab_view: adw::TabView,
+    pub(crate) tabs: RefCell<Vec<Rc<Tab>>>,
     pub(crate) sidebar: Rc<Sidebar>,
     pub(crate) pathbar: Rc<PathBar>,
     pub(crate) jobs: Rc<JobMonitor>,
@@ -62,6 +113,13 @@ pub struct Window {
     pub(crate) search_bar: gtk::SearchBar,
     pub(crate) search_entry: gtk::SearchEntry,
     pub(crate) status_label: gtk::Label,
+    /// The "48px" readout in the icon-size popover, updated whenever the size
+    /// changes so the popover cannot go on reporting a stale value while its
+    /// own buttons are being clicked.
+    pub(crate) zoom_label: gtk::Label,
+    /// The pill currently showing a repeatedly-updated value, so the next one
+    /// can replace it rather than queue behind it.
+    pub(crate) transient_toast_handle: Rc<RefCell<Option<adw::Toast>>>,
     pub(crate) capacity_label: gtk::Label,
     pub(crate) banner: adw::Banner,
 
@@ -69,18 +127,9 @@ pub struct Window {
     pub(crate) forward_button: gtk::Button,
     pub(crate) up_button: gtk::Button,
 
-    pub(crate) history: RefCell<History>,
-    pub(crate) location: RefCell<Location>,
-    /// Entries currently loaded, kept so actions can work on the selection
-    /// without re-querying the filesystem.
-    pub(crate) entries: RefCell<Vec<FileEntry>>,
     pub(crate) volumes: RefCell<Vec<Volume>>,
     pub(crate) clipboard: RefCell<Option<Clip>>,
 
-    /// Bumped on every navigation so a slow scan can detect it was superseded.
-    pub(crate) scan_generation: Cell<u64>,
-    pub(crate) scan_cancellable: RefCell<gio::Cancellable>,
-    pub(crate) dir_monitor: RefCell<Option<gio::FileMonitor>>,
     /// Debounce timer for filesystem-change-triggered reloads.
     pub(crate) reload_timer: RefCell<Option<glib::SourceId>>,
     pub(crate) save_timer: RefCell<Option<glib::SourceId>>,
@@ -107,6 +156,8 @@ pub struct Window {
 /// which one is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerAction {
+    /// Empties the freedesktop recent-files list.
+    ClearRecent,
     None,
     EmptyTrash,
     StopSearch,
@@ -126,7 +177,14 @@ impl Window {
             window.maximize();
         }
 
-        let view = FileView::new(Rc::clone(&config));
+        let first_tab = Tab::new(&config, start.clone());
+
+        // `autohide` keeps the strip out of the way until there is more than
+        // one tab, so nothing about the single-tab window changes.
+        let tab_view = adw::TabView::new();
+        let tab_bar = adw::TabBar::builder().view(&tab_view).autohide(true).build();
+        let first_page = tab_view.append(first_tab.view.widget());
+        first_page.set_title(&first_tab.title());
         let sidebar = Sidebar::new();
         let pathbar = PathBar::new();
         let jobs = JobMonitor::new();
@@ -160,10 +218,11 @@ impl Window {
             .action_name("win.toggle-view")
             .build();
 
+        let (zoom_popover, zoom_label) = build_zoom_popover(&config);
         let zoom_button = gtk::MenuButton::builder()
             .icon_name("zoom-in-symbolic")
             .tooltip_text("Icon size")
-            .popover(&build_zoom_popover(&config))
+            .popover(&zoom_popover)
             .build();
 
         let menu_button = gtk::MenuButton::builder()
@@ -227,7 +286,8 @@ impl Window {
         let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         content.append(&search_bar);
         content.append(&banner);
-        content.append(view.widget());
+        content.append(&tab_bar);
+        content.append(&tab_view);
         content.append(jobs.widget());
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         content.append(&status_bar);
@@ -273,7 +333,8 @@ impl Window {
             window,
             app: app.clone(),
             config,
-            view,
+            tab_view,
+            tabs: RefCell::new(vec![first_tab]),
             sidebar,
             pathbar,
             jobs,
@@ -282,19 +343,15 @@ impl Window {
             search_bar,
             search_entry,
             status_label,
+            zoom_label,
+            transient_toast_handle: Rc::new(RefCell::new(None)),
             capacity_label,
             banner,
             back_button,
             forward_button,
             up_button,
-            history: RefCell::new(History::new(start.clone())),
-            location: RefCell::new(Location::Directory(start.clone())),
-            entries: RefCell::new(Vec::new()),
             volumes: RefCell::new(Vec::new()),
             clipboard: RefCell::new(None),
-            scan_generation: Cell::new(0),
-            scan_cancellable: RefCell::new(gio::Cancellable::new()),
-            dir_monitor: RefCell::new(None),
             reload_timer: RefCell::new(None),
             save_timer: RefCell::new(None),
             search_job: RefCell::new(None),
@@ -337,32 +394,30 @@ impl Window {
             this.open_path(path);
         });
 
+        self.wire_view(&self.view());
+
+        // Switching tabs changes what every piece of shared chrome is talking
+        // about, so the window re-reads the new tab rather than tracking
+        // changes as they happen.
         let weak = Rc::downgrade(self);
-        self.view.connect_activate(move |obj| {
+        self.tab_view.connect_selected_page_notify(move |_| {
             let Some(this) = weak.upgrade() else { return };
-            this.activate_item(&obj.entry());
+            this.sync_to_active_tab();
         });
 
+        // Closing the last tab would leave a window with nothing in it; close
+        // the window instead, which is what every tabbed app does.
         let weak = Rc::downgrade(self);
-        self.view.connect_selection_changed(move || {
+        self.tab_view.connect_close_page(move |view, page| {
             if let Some(this) = weak.upgrade() {
-                this.update_status();
+                this.tabs.borrow_mut().retain(|tab| {
+                    tab.view.widget().upcast_ref::<gtk::Widget>() != &page.child()
+                });
+                if view.n_pages() <= 1 {
+                    this.window.close();
+                }
             }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.view.connect_context_menu(move |(x, y)| {
-            if let Some(this) = weak.upgrade() {
-                this.show_context_menu(x, y);
-            }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.view.connect_drop(move |(paths, onto)| {
-            let Some(this) = weak.upgrade() else { return };
-            let destination = onto.or_else(|| this.current_dir());
-            let Some(destination) = destination else { return };
-            this.drop_files(paths, destination);
+            glib::Propagation::Proceed
         });
 
         let weak = Rc::downgrade(self);
@@ -376,6 +431,13 @@ impl Window {
         self.sidebar.connect_open_trash(move || {
             if let Some(this) = weak.upgrade() {
                 this.navigate_to(Location::Trash, true);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_open_recent(move || {
+            if let Some(this) = weak.upgrade() {
+                this.navigate_to(Location::Recent, true);
             }
         });
 
@@ -436,8 +498,8 @@ impl Window {
             let Some(this) = weak.upgrade() else { return };
             if !bar.is_search_mode() {
                 this.search_entry.set_text("");
-                this.view.set_search("");
-                this.view.focus_first();
+                this.view().set_search("");
+                this.view().focus_first();
                 this.update_status();
             }
         });
@@ -456,7 +518,7 @@ impl Window {
             this.zoom(if dy < 0.0 { 1 } else { -1 });
             glib::Propagation::Stop
         });
-        self.view.widget().add_controller(scroll);
+        self.view().widget().add_controller(scroll);
 
         // Mouse back/forward buttons.
         let buttons = gtk::GestureClick::new();
@@ -482,6 +544,10 @@ impl Window {
                     WidgetExt::activate_action(&this.window, "win.empty-trash", None).ok();
                 }
                 BannerAction::StopSearch => this.stop_search(),
+                BannerAction::ClearRecent => {
+                    crate::fs::recent::clear();
+                    this.reload();
+                }
                 BannerAction::None => {}
             }
         });
@@ -505,17 +571,146 @@ impl Window {
         });
     }
 
+    /// Connects one view's signals to the window.
+    ///
+    /// Called for every tab, not once at startup: each tab owns its own view,
+    /// and a view nobody is listening to is a tab where nothing happens when
+    /// you double-click.
+    fn wire_view(self: &Rc<Self>, view: &Rc<FileView>) {
+        let weak = Rc::downgrade(self);
+        view.connect_activate(move |obj| {
+            let Some(this) = weak.upgrade() else { return };
+            this.activate_item(&obj.entry());
+        });
+
+        let weak = Rc::downgrade(self);
+        view.connect_selection_changed(move || {
+            if let Some(this) = weak.upgrade() {
+                this.update_status();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        view.connect_context_menu(move |(x, y)| {
+            if let Some(this) = weak.upgrade() {
+                this.show_context_menu(x, y);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        view.connect_drop(move |(paths, onto)| {
+            let Some(this) = weak.upgrade() else { return };
+            let destination = onto.or_else(|| this.current_dir());
+            let Some(destination) = destination else { return };
+            this.drop_files(paths, destination);
+        });
+    }
+
+    /// Opens `location` in a new tab and switches to it.
+    pub(crate) fn open_in_new_tab(self: &Rc<Self>, location: Location) {
+        let start = location.as_path().map(Path::to_path_buf).unwrap_or_else(|| {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+        });
+        let tab = Tab::new(&self.config, start);
+        tab.view.set_view_mode(self.config.borrow().view_mode);
+        self.wire_view(&tab.view);
+
+        let page = self.tab_view.append(tab.view.widget());
+        page.set_title(&tab.title());
+        self.tabs.borrow_mut().push(tab);
+
+        // Selecting the page fires `selected-page`, which syncs the chrome;
+        // the navigation then happens against the tab now in front.
+        self.tab_view.set_selected_page(&page);
+        self.navigate_to(location, false);
+    }
+
+    pub(crate) fn close_current_tab(self: &Rc<Self>) {
+        if let Some(page) = self.tab_view.selected_page() {
+            self.tab_view.close_page(&page);
+        }
+    }
+
+    /// Moves `offset` tabs along, wrapping at both ends.
+    pub(crate) fn cycle_tab(self: &Rc<Self>, offset: i32) {
+        let count = self.tab_view.n_pages();
+        if count < 2 {
+            return;
+        }
+        let Some(page) = self.tab_view.selected_page() else { return };
+        let current = self.tab_view.page_position(&page);
+        let next = (current + offset).rem_euclid(count);
+        self.tab_view.set_selected_page(&self.tab_view.nth_page(next));
+    }
+
+    /// Points the shared chrome at whichever tab is now in front.
+    fn sync_to_active_tab(self: &Rc<Self>) {
+        let tab = self.tab();
+        let location = tab.location.borrow().clone();
+
+        match &location {
+            Location::Directory(path) => {
+                self.pathbar.set_path(path);
+                self.sidebar.set_current(path);
+            }
+            Location::Trash => self.pathbar.set_virtual("Trash", "user-trash-symbolic"),
+            Location::Recent => {
+                self.pathbar.set_virtual("Recent", "document-open-recent-symbolic")
+            }
+        }
+        self.update_nav_buttons();
+        self.update_status();
+        if let Some(path) = location.as_path() {
+            self.update_capacity(path);
+        }
+    }
+
+    /// Keeps the tab's label in step with where it has navigated to.
+    fn update_tab_title(&self) {
+        let tab = self.tab();
+        if let Some(page) = self.tab_view.selected_page() {
+            page.set_title(&tab.title());
+        }
+    }
+
+    // ── tabs ───────────────────────────────────────────────────────────────
+
+    /// The tab in front.
+    ///
+    /// Returns an `Rc` rather than a reference because callers routinely hold
+    /// it across an `await`, and because a borrow tied to `&self` would forbid
+    /// the very `RefCell` access it exists to provide. Bind it to a local
+    /// before borrowing anything inside it — a temporary would be dropped while
+    /// the guard is still alive.
+    pub(crate) fn tab(&self) -> Rc<Tab> {
+        let tabs = self.tabs.borrow();
+        self.tab_view
+            .selected_page()
+            .and_then(|page| {
+                let child = page.child();
+                tabs.iter().find(|tab| tab.view.widget().upcast_ref::<gtk::Widget>() == &child).cloned()
+            })
+            // There is always at least one tab; closing the last one closes the
+            // window instead.
+            .or_else(|| tabs.first().cloned())
+            .expect("a window always has at least one tab")
+    }
+
+    pub(crate) fn view(&self) -> Rc<FileView> {
+        Rc::clone(&self.tab().view)
+    }
+
     // ── navigation ─────────────────────────────────────────────────────────
 
     pub(crate) fn current_dir(&self) -> Option<PathBuf> {
-        match &*self.location.borrow() {
+        match &*self.tab().location.borrow() {
             Location::Directory(p) => Some(p.clone()),
-            Location::Trash => None,
+            Location::Trash | Location::Recent => None,
         }
     }
 
     pub(crate) fn in_trash(&self) -> bool {
-        matches!(&*self.location.borrow(), Location::Trash)
+        matches!(&*self.tab().location.borrow(), Location::Trash)
     }
 
     /// Navigates to a path, or opens it if it turns out to be a file.
@@ -532,7 +727,7 @@ impl Window {
                 let weak = Rc::downgrade(self);
                 glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
                     if let Some(this) = weak.upgrade() {
-                        this.view.select_paths(&[target]);
+                        this.view().select_paths(&[target]);
                     }
                 });
             }
@@ -542,20 +737,25 @@ impl Window {
     }
 
     pub(crate) fn navigate_to(self: &Rc<Self>, location: Location, push_history: bool) {
+        // One lookup for the whole function: every access below is against the
+        // tab that was in front when navigation started.
+        let tab = self.tab();
+
         if push_history && let Some(path) = location.as_path() {
-            self.history.borrow_mut().push(path.to_path_buf());
+            tab.history.borrow_mut().push(path.to_path_buf());
         }
 
-        *self.location.borrow_mut() = location.clone();
+        *tab.location.borrow_mut() = location.clone();
+        self.update_tab_title();
 
         // Cancel any scan still running for the previous directory.
-        self.scan_cancellable.borrow().cancel();
-        *self.scan_cancellable.borrow_mut() = gio::Cancellable::new();
-        let generation = self.scan_generation.get() + 1;
-        self.scan_generation.set(generation);
+        tab.scan_cancellable.borrow().cancel();
+        *tab.scan_cancellable.borrow_mut() = gio::Cancellable::new();
+        let generation = tab.scan_generation.get() + 1;
+        tab.scan_generation.set(generation);
 
-        self.view.clear();
-        self.entries.borrow_mut().clear();
+        self.view().clear();
+        self.tab().entries.borrow_mut().clear();
         // A walk rooted at the folder we are leaving is no longer wanted.
         self.search_generation.set(self.search_generation.get() + 1);
         *self.search_job.borrow_mut() = None;
@@ -563,7 +763,7 @@ impl Window {
         self.navigating.set(true);
         self.search_bar.set_search_mode(false);
         self.search_entry.set_text("");
-        self.view.set_search("");
+        self.view().set_search("");
         self.navigating.set(false);
 
         match &location {
@@ -575,10 +775,13 @@ impl Window {
                 self.install_monitor(path);
                 self.load_directory(path.clone(), generation);
             }
+            Location::Recent => {
+                self.load_recent(generation);
+            }
             Location::Trash => {
                 self.window.set_title(Some("Trash"));
                 self.sidebar.set_current(Path::new("<trash>"));
-                *self.dir_monitor.borrow_mut() = None;
+                *self.tab().dir_monitor.borrow_mut() = None;
                 self.load_trash(generation);
             }
         }
@@ -588,26 +791,32 @@ impl Window {
 
     fn load_directory(self: &Rc<Self>, path: PathBuf, generation: u64) {
         let weak = Rc::downgrade(self);
-        let cancellable = self.scan_cancellable.borrow().clone();
+        // The scan belongs to the tab that started it, so the tab is captured
+        // here rather than looked up when each batch lands. Resolving the
+        // active tab inside the callback meant that switching tabs — or simply
+        // opening two in quick succession — delivered one tab's entries into
+        // whichever view happened to be in front, which showed up as duplicated
+        // and misplaced rows.
+        let tab = self.tab();
+        let cancellable = tab.scan_cancellable.borrow().clone();
 
         glib::spawn_future_local(async move {
             let _span = crate::trace::Span::new(format!("scan {}", path.display()));
             let result = {
-                let weak = weak.clone();
                 let path = path.clone();
+                let tab = Rc::clone(&tab);
                 scan::scan_dir(&path.clone(), &cancellable, move |batch| {
-                    let Some(this) = weak.upgrade() else { return };
-                    if this.scan_generation.get() != generation {
+                    if tab.scan_generation.get() != generation {
                         return;
                     }
-                    this.entries.borrow_mut().extend(batch.iter().cloned());
-                    this.view.append_batch(batch);
+                    tab.entries.borrow_mut().extend(batch.iter().cloned());
+                    tab.view.append_batch(batch);
                 })
                 .await
             };
 
             let Some(this) = weak.upgrade() else { return };
-            if this.scan_generation.get() != generation {
+            if tab.scan_generation.get() != generation {
                 return;
             }
 
@@ -619,10 +828,45 @@ impl Window {
                 );
             }
 
-            this.update_status();
-            this.update_capacity(&path);
-            this.view.focus_first();
+            // Only the tab in front owns the shared chrome; a background tab
+            // finishing its scan must not repaint the status bar for another.
+            if Rc::ptr_eq(&tab, &this.tab()) {
+                this.update_status();
+                this.update_capacity(&path);
+                tab.view.focus_first();
+            }
         });
+    }
+
+    /// Lists recently used files.
+    ///
+    /// Reading the list is a parse plus a `stat` per entry, both cheap enough
+    /// to stay on the main thread — and `GtkRecentManager` has to be, being
+    /// unsafe to touch from anywhere else.
+    fn load_recent(self: &Rc<Self>, generation: u64) {
+        if self.tab().scan_generation.get() != generation {
+            return;
+        }
+
+        let entries: Vec<FileEntry> =
+            crate::fs::recent::list().iter().filter_map(recent_entry).collect();
+        let empty = entries.is_empty();
+
+        *self.tab().entries.borrow_mut() = entries.clone();
+        self.view().append_batch(entries);
+        self.pathbar.set_virtual("Recent", "document-open-recent-symbolic");
+
+        if empty {
+            self.set_banner(BannerAction::None, "No recently used files yet", None);
+        } else {
+            self.set_banner(
+                BannerAction::ClearRecent,
+                "Files you have opened recently, newest first",
+                Some("Clear"),
+            );
+        }
+        self.update_status();
+        self.view().focus_first();
     }
 
     fn load_trash(self: &Rc<Self>, generation: u64) {
@@ -641,7 +885,7 @@ impl Window {
 
             let Ok(items) = rx.recv().await else { return };
             let Some(this) = weak.upgrade() else { return };
-            if this.scan_generation.get() != generation {
+            if this.tab().scan_generation.get() != generation {
                 return;
             }
 
@@ -650,8 +894,8 @@ impl Window {
                 .filter_map(trash_entry)
                 .collect();
 
-            *this.entries.borrow_mut() = entries.clone();
-            this.view.append_batch(entries);
+            *this.tab().entries.borrow_mut() = entries.clone();
+            this.view().append_batch(entries);
 
             this.pathbar.set_virtual("Trash", "user-trash-symbolic");
             let (title, button) = if items.is_empty() {
@@ -674,7 +918,7 @@ impl Window {
         let Ok(monitor) =
             file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
         else {
-            *self.dir_monitor.borrow_mut() = None;
+            *self.tab().dir_monitor.borrow_mut() = None;
             return;
         };
 
@@ -684,7 +928,7 @@ impl Window {
             this.schedule_reload();
         });
 
-        *self.dir_monitor.borrow_mut() = Some(monitor);
+        *self.tab().dir_monitor.borrow_mut() = Some(monitor);
     }
 
     /// Coalesces a burst of filesystem events into one reload.
@@ -713,8 +957,8 @@ impl Window {
             return;
         }
 
-        let selected = self.view.selected_paths();
-        let location = self.location.borrow().clone();
+        let selected = self.view().selected_paths();
+        let location = self.tab().location.borrow().clone();
         self.navigate_to(location, false);
 
         // Restore the selection once the new listing has had a chance to load.
@@ -722,19 +966,19 @@ impl Window {
             let weak = Rc::downgrade(self);
             glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
                 if let Some(this) = weak.upgrade() {
-                    this.view.select_paths(&selected);
+                    this.view().select_paths(&selected);
                 }
             });
         }
     }
 
     pub(crate) fn go_back(self: &Rc<Self>) {
-        let Some(path) = self.history.borrow_mut().go_back() else { return };
+        let Some(path) = self.tab().history.borrow_mut().go_back() else { return };
         self.navigate_to(Location::Directory(path), false);
     }
 
     pub(crate) fn go_forward(self: &Rc<Self>) {
-        let Some(path) = self.history.borrow_mut().go_forward() else { return };
+        let Some(path) = self.tab().history.borrow_mut().go_forward() else { return };
         self.navigate_to(Location::Directory(path), false);
     }
 
@@ -745,7 +989,11 @@ impl Window {
     }
 
     fn update_nav_buttons(&self) {
-        let history = self.history.borrow();
+        // Bound to a local first: `self.tab()` hands back an `Rc`, and
+        // borrowing straight out of the temporary would free it at the end of
+        // the statement while the guard is still alive.
+        let tab = self.tab();
+        let history = tab.history.borrow();
         self.back_button.set_sensitive(history.can_go_back());
         self.forward_button.set_sensitive(history.can_go_forward());
 
@@ -804,8 +1052,8 @@ impl Window {
     // ── status ─────────────────────────────────────────────────────────────
 
     pub(crate) fn update_status(&self) {
-        let selected = self.view.selected();
-        let (visible, bytes, folders) = self.view.visible_stats();
+        let selected = self.view().selected();
+        let (visible, bytes, folders) = self.view().visible_stats();
 
         let text = if selected.is_empty() {
             let files = visible.saturating_sub(folders);
@@ -867,7 +1115,7 @@ impl Window {
     /// The local filter is instant and covers the common case; the recursive
     /// walk is what makes searching from Home actually find anything.
     pub(crate) fn update_search(self: &Rc<Self>, query: &str) {
-        self.view.set_search(query);
+        self.view().set_search(query);
         self.update_status();
         self.stop_search();
 
@@ -905,7 +1153,7 @@ impl Window {
                 match event {
                     crate::fs::search::SearchEvent::Matches(batch) => {
                         found += batch.len();
-                        this.view.append_batch(batch);
+                        this.view().append_batch(batch);
                         this.update_status();
                     }
                     crate::fs::search::SearchEvent::Finished { total, truncated } => {
@@ -950,6 +1198,37 @@ impl Window {
         self.toasts.add_toast(adw::Toast::new(message));
     }
 
+    /// A toast that supersedes the last one of its kind instead of queueing
+    /// behind it.
+    ///
+    /// `AdwToastOverlay` shows toasts one at a time, each for its full timeout.
+    /// That is right for messages that each report a distinct event, and wrong
+    /// for one that repeats as a value is nudged: changing the icon size six
+    /// times queued six pills, so the reading crawled along seconds behind the
+    /// icons and kept announcing sizes that were no longer current. Dismissing
+    /// the previous one keeps a single pill that always shows the latest value.
+    pub(crate) fn transient_toast(&self, message: &str) {
+        // Take the handle out before the body runs. Reading it in the `if let`
+        // scrutinee keeps the `RefMut` alive for the whole body, and
+        // `dismiss()` synchronously fires the handler below, which borrows the
+        // same cell — "RefCell already borrowed", every time.
+        let previous = self.transient_toast_handle.borrow_mut().take();
+        if let Some(previous) = previous {
+            previous.dismiss();
+        }
+        let toast = adw::Toast::builder().title(message).timeout(2).build();
+        // Clear the handle when it goes on its own, so a later call is not
+        // dismissing something already gone.
+        let slot = Rc::downgrade(&self.transient_toast_handle);
+        toast.connect_dismissed(move |_| {
+            if let Some(slot) = slot.upgrade() {
+                slot.borrow_mut().take();
+            }
+        });
+        *self.transient_toast_handle.borrow_mut() = Some(toast.clone());
+        self.toasts.add_toast(toast);
+    }
+
     /// A toast with an action button, e.g. "Undo" after a trash operation.
     pub(crate) fn toast_with_action(
         &self,
@@ -981,14 +1260,16 @@ impl Window {
         }
         // Cached thumbnails are keyed by size, so old entries are dead weight.
         crate::ui::thumbs::clear();
-        self.view.refresh_items();
+        self.view().refresh_items();
         self.schedule_save();
-        self.toast(&format!("Icon size: {}px", self.config.borrow().icon_size));
+        let size = self.config.borrow().icon_size;
+        self.zoom_label.set_label(&format!("{size}px"));
+        self.transient_toast(&format!("Icon size: {size}px"));
     }
 
     pub(crate) fn set_view_mode(self: &Rc<Self>, mode: ViewMode) {
         self.config.borrow_mut().view_mode = mode;
-        self.view.set_view_mode(mode);
+        self.view().set_view_mode(mode);
         self.schedule_save();
     }
 
@@ -1062,8 +1343,8 @@ impl Window {
 
     /// Navigates away from a directory that has disappeared.
     pub(crate) fn recover_from_missing_directory(self: &Rc<Self>, gone: &Path) {
-        self.history.borrow_mut().forget(gone);
-        let fallback = self.history.borrow().current().to_path_buf();
+        self.tab().history.borrow_mut().forget(gone);
+        let fallback = self.tab().history.borrow().current().to_path_buf();
         self.toast(&format!("“{}” is no longer available", gone.display()));
         self.navigate_to(Location::Directory(fallback), false);
     }
@@ -1119,6 +1400,46 @@ fn display_title(path: &Path) -> String {
 
 /// Builds a listable entry for a trashed item, showing the name it had
 /// originally rather than the mangled name inside `Trash/files`.
+/// Builds a listing entry for a recently used file.
+///
+/// Recent items are individual files gathered from all over the filesystem, so
+/// unlike a directory scan there is no shared parent to take metadata from and
+/// each one is `stat`ed on its own.
+fn recent_entry(item: &crate::fs::recent::RecentItem) -> Option<FileEntry> {
+    let md = std::fs::symlink_metadata(&item.path).ok()?;
+    let name = item.path.file_name()?.to_string_lossy().into_owned();
+    let is_dir = md.is_dir();
+
+    Some(FileEntry {
+        search_key: name.to_lowercase(),
+        display_name: name.clone(),
+        content_type: crate::fs::entry::guess_content_type(&name, is_dir, md.len(), {
+            use std::os::unix::fs::PermissionsExt;
+            md.permissions().mode()
+        }),
+        name,
+        path: item.path.clone(),
+        is_dir,
+        is_symlink: md.file_type().is_symlink(),
+        symlink_target: None,
+        is_hidden: false,
+        size: md.len(),
+        // The recency shown is when the file was last *opened*, which is the
+        // ordering of this view and more useful here than the mtime.
+        modified: Some(item.visited),
+        can_read: true,
+        can_write: !md.permissions().readonly(),
+        can_execute: {
+            use std::os::unix::fs::PermissionsExt;
+            md.permissions().mode() & 0o111 != 0
+        },
+        mode: {
+            use std::os::unix::fs::PermissionsExt;
+            md.permissions().mode()
+        },
+    })
+}
+
 fn trash_entry(item: &crate::fs::trash::TrashItem) -> Option<FileEntry> {
     let md = std::fs::symlink_metadata(&item.file_path).ok()?;
     let display_name = item
@@ -1156,7 +1477,7 @@ fn trash_entry(item: &crate::fs::trash::TrashItem) -> Option<FileEntry> {
     })
 }
 
-fn build_zoom_popover(config: &Rc<RefCell<Config>>) -> gtk::Popover {
+fn build_zoom_popover(config: &Rc<RefCell<Config>>) -> (gtk::Popover, gtk::Label) {
     let boxed = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -1201,13 +1522,28 @@ fn build_zoom_popover(config: &Rc<RefCell<Config>>) -> gtk::Popover {
         .build();
     boxed.append(&current);
 
-    gtk::Popover::builder().child(&boxed).build()
+    let popover = gtk::Popover::builder().child(&boxed).build();
+
+    // Read the size when the popover opens rather than baking it in when the
+    // popover is built. It was built once at startup, so Ctrl+scroll resized
+    // the icons while this label went on claiming the old value — and every
+    // other route that changes the size had the same problem. Reading it here
+    // is correct no matter which one did it.
+    let config = Rc::clone(config);
+    let label = current.clone();
+    popover.connect_show(move |_| {
+        label.set_label(&format!("{}px", config.borrow().icon_size));
+    });
+
+    (popover, current)
 }
 
 fn build_main_menu() -> gio::Menu {
     let menu = gio::Menu::new();
 
     let files = gio::Menu::new();
+    files.append(Some("New Tab"), Some("win.new-tab"));
+    files.append(Some("Download from URL…"), Some("win.download"));
     files.append(Some("New Folder"), Some("win.new-folder"));
     files.append(Some("New File"), Some("win.new-file"));
     files.append(Some("Open Terminal Here"), Some("win.open-terminal"));

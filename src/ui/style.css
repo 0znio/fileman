@@ -8,11 +8,6 @@
  * so the app still belongs on the desktop.
  */
 
-/* One accent, carried through selection, focus and meters. Teal rather than
-   the platform blue, so the app reads as its own thing. */
-@define-color fm_accent #0F9B8E;
-@define-color fm_accent_bright #33C7B7;
-
 /* ── surfaces ───────────────────────────────────────────────────────────
  * Colours come from libadwaita, so the app follows the system light/dark
  * scheme and stays legible in both. The identity is carried by the accent, the
@@ -20,7 +15,11 @@
  * by overriding the platform's chrome, which only made the sidebar
  * unreadable. */
 
+/* One accent, carried through selection, focus and meters. Both values are
+   replaced at load time from the user's setting; see `app::load_stylesheet`.
+   The literals here are the default and what the file falls back to. */
 @define-color fm_accent #E04434;
+@define-color fm_accent_bright #E9705F;
 
 /* Two matching panels with a gap between them. The sidebar used to keep square
    corners while the file area was rounded, so the two met in a mismatched
@@ -197,3 +196,21 @@ row.drop-target {
 }
 
 .property .subtitle { font-family: monospace; }
+
+/* Accent swatches in Settings. The colour itself comes from a per-button
+   provider; these rules only give them a consistent shape and a clear mark for
+   the one in use. */
+.accent-swatch {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px alpha(black, 0.18);
+}
+
+.accent-swatch-selected {
+  box-shadow:
+    inset 0 0 0 1px alpha(black, 0.18),
+    0 0 0 2px @view_bg_color,
+    0 0 0 4px @fm_accent;
+}

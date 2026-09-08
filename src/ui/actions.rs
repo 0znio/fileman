@@ -46,9 +46,14 @@ impl Window {
         });
 
         // ── selection ─────────────────────────────────────────────────────
-        self.simple("select-all", |this| this.view.select_all());
-        self.simple("select-none", |this| this.view.select_none());
-        self.simple("invert-selection", |this| this.view.invert_selection());
+        self.simple("select-all", |this| {
+            if this.forward_to_text_entry("selection.select-all") {
+                return;
+            }
+            this.view().select_all()
+        });
+        self.simple("select-none", |this| this.view().select_none());
+        self.simple("invert-selection", |this| this.view().invert_selection());
 
         // ── files ─────────────────────────────────────────────────────────
         self.simple("open", |this| {
@@ -60,9 +65,51 @@ impl Window {
         self.simple("new-folder", |this| this.create_new(true));
         self.simple("new-file", |this| this.create_new(false));
         self.simple("rename", |this| this.rename_selected());
-        self.simple("copy", |this| this.copy_to_clipboard(false));
-        self.simple("cut", |this| this.copy_to_clipboard(true));
-        self.simple("paste", |this| this.paste());
+        // These three are window accelerators, which GTK dispatches before the
+        // focused widget ever sees the key. Without the check, Ctrl+C in the
+        // location bar copied the *selected files* and left the typed path
+        // stubbornly uncopyable.
+        self.simple("copy", |this| {
+            if this.forward_to_text_entry("clipboard.copy") {
+                return;
+            }
+            this.copy_to_clipboard(false)
+        });
+        self.simple("cut", |this| {
+            if this.forward_to_text_entry("clipboard.cut") {
+                return;
+            }
+            this.copy_to_clipboard(true)
+        });
+        self.simple("download", |this| this.download_file());
+        self.simple("new-tab", |this| {
+            let here = this
+                .current_dir()
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+            this.open_in_new_tab(Location::Directory(here));
+        });
+        self.simple("close-tab", |this| this.close_current_tab());
+        self.simple("next-tab", |this| this.cycle_tab(1));
+        self.simple("previous-tab", |this| this.cycle_tab(-1));
+        self.simple("open-in-new-tab", |this| {
+            // Folders open in their own tab; a file has nothing to open a tab
+            // on, so it is left alone rather than silently ignored.
+            let folders: Vec<PathBuf> =
+                this.selected_entries().into_iter().filter(|e| e.is_dir).map(|e| e.path).collect();
+            if folders.is_empty() {
+                this.toast("Select a folder to open in a new tab");
+                return;
+            }
+            for path in folders {
+                this.open_in_new_tab(Location::Directory(path));
+            }
+        });
+        self.simple("paste", |this| {
+            if this.forward_to_text_entry("clipboard.paste") {
+                return;
+            }
+            this.paste()
+        });
         self.simple("trash", |this| this.delete_selected(false));
         self.simple("delete-permanently", |this| this.delete_selected(true));
         self.simple("shred", |this| this.shred_selected());
@@ -108,7 +155,7 @@ impl Window {
         self.simple("zoom-reset", |this| {
             this.config.borrow_mut().icon_size = crate::config::DEFAULT_ICON_SIZE;
             crate::ui::thumbs::clear();
-            this.view.refresh_items();
+            this.view().refresh_items();
             this.schedule_save();
         });
         self.simple("toggle-sidebar", |this| {
@@ -121,19 +168,19 @@ impl Window {
         // Stateful toggles so the menu shows a checkmark.
         self.toggle("toggle-hidden", self.config.borrow().show_hidden, |this, on| {
             this.config.borrow_mut().show_hidden = on;
-            this.view.refilter();
+            this.view().refilter();
             this.update_status();
             this.schedule_save();
         });
         self.toggle("toggle-dirs-first", self.config.borrow().dirs_first, |this, on| {
             this.config.borrow_mut().dirs_first = on;
-            this.view.apply_sort_from_config();
+            this.view().apply_sort_from_config();
             this.schedule_save();
         });
         self.toggle("toggle-thumbnails", self.config.borrow().show_thumbnails, |this, on| {
             this.config.borrow_mut().show_thumbnails = on;
             crate::ui::thumbs::clear();
-            this.view.refresh_items();
+            this.view().refresh_items();
             this.schedule_save();
         });
         self.toggle(
@@ -141,7 +188,7 @@ impl Window {
             self.config.borrow().sort_descending,
             |this, on| {
                 this.config.borrow_mut().sort_descending = on;
-                this.view.apply_sort_from_config();
+                this.view().apply_sort_from_config();
                 this.schedule_save();
             },
         );
@@ -161,7 +208,7 @@ impl Window {
                 _ => SortKey::Name,
             };
             this.config.borrow_mut().sort_key = key;
-            this.view.apply_sort_from_config();
+            this.view().apply_sort_from_config();
             this.schedule_save();
         });
 
@@ -273,13 +320,19 @@ impl Window {
             ("win.open", &["Return", "<Ctrl>o"]),
             ("win.new-folder", &["<Ctrl><Shift>n"]),
             ("win.new-file", &["<Ctrl><Shift>t"]),
-            ("win.rename", &["F2"]),
+
+            ("win.download", &["<Ctrl><Shift>d"]),
+            ("win.new-tab", &["<Ctrl>t"]),
+            ("win.close-tab", &["<Ctrl>w"]),
+            ("win.next-tab", &["<Ctrl>Tab", "<Ctrl>Page_Down"]),
+            ("win.previous-tab", &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"]),
             ("win.copy", &["<Ctrl>c"]),
             ("win.cut", &["<Ctrl>x"]),
             ("win.paste", &["<Ctrl>v"]),
-            ("win.trash", &["Delete", "BackSpace"]),
-            ("win.delete-permanently", &["<Shift>Delete"]),
-            ("win.shred", &["<Ctrl><Shift>Delete"]),
+            // Delete, BackSpace, Shift+Delete, Ctrl+Shift+Delete and F2 are
+            // deliberately absent: they are handled by the file view's own key
+            // controller so they cannot outrank a focused text entry. See
+            // `FileView::attach_context_menu`.
             ("win.properties", &["<Alt>Return"]),
             ("win.copy-path", &["<Ctrl><Shift>c"]),
             ("win.open-terminal", &["<Ctrl><Alt>t"]),
@@ -304,13 +357,17 @@ impl Window {
     // ── selection helpers ──────────────────────────────────────────────────
 
     pub(crate) fn selected_entries(&self) -> Vec<FileEntry> {
-        self.view.selected().iter().map(|o| o.entry()).collect()
+        self.view().selected().iter().map(|o| o.entry()).collect()
     }
 
     fn selected_or_toast(&self, what: &str) -> Vec<FileEntry> {
         let entries = self.selected_entries();
         if entries.is_empty() {
-            self.toast(&format!("Select something to {what}"));
+            // Transient, because this is a nag that can repeat: a key held down,
+            // or a shortcut pressed while nothing is selected, would otherwise
+            // queue one five-second pill per press and leave the window looking
+            // frozen behind a wall of them long after the cause had passed.
+            self.transient_toast(&format!("Select something to {what}"));
         }
         entries
     }
@@ -350,7 +407,7 @@ impl Window {
                     let weak = Rc::downgrade(&this);
                     glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
                         if let Some(this) = weak.upgrade() {
-                            this.view.select_paths(&[path]);
+                            this.view().select_paths(&[path]);
                         }
                     });
                 }
@@ -395,7 +452,7 @@ impl Window {
                     let weak = Rc::downgrade(&this);
                     glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
                         if let Some(this) = weak.upgrade() {
-                            this.view.select_paths(&[path]);
+                            this.view().select_paths(&[path]);
                         }
                     });
                 }
@@ -404,8 +461,23 @@ impl Window {
         });
     }
 
+    /// Hands a clipboard action to the focused text widget, if there is one.
+    ///
+    /// Returns whether it was handled, so the caller can fall through to the
+    /// file-manager meaning of the same shortcut when the user is not typing.
+    fn forward_to_text_entry(self: &Rc<Self>, action: &str) -> bool {
+        let Some(focus) = gtk::prelude::GtkWindowExt::focus(&self.window) else { return false };
+        // `GtkEntry` delegates to an internal `GtkText`; that inner widget is
+        // what actually holds focus and owns the clipboard actions.
+        if !focus.is::<gtk::Text>() {
+            return false;
+        }
+        let _ = WidgetExt::activate_action(&focus, action, None);
+        true
+    }
+
     fn copy_to_clipboard(self: &Rc<Self>, is_cut: bool) {
-        let paths = self.view.selected_paths();
+        let paths = self.view().selected_paths();
         if paths.is_empty() {
             self.toast(if is_cut { "Select something to cut" } else { "Select something to copy" });
             return;
@@ -438,7 +510,7 @@ impl Window {
     }
 
     fn copy_paths_as_text(&self) {
-        let paths = self.view.selected_paths();
+        let paths = self.view().selected_paths();
         if paths.is_empty() {
             self.toast("Select something first");
             return;
@@ -532,7 +604,7 @@ impl Window {
                 let weak = Rc::downgrade(&this);
                 glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
                     if let Some(this) = weak.upgrade() {
-                        this.view.select_paths(&created);
+                        this.view().select_paths(&created);
                     }
                 });
             }
@@ -673,6 +745,73 @@ impl Window {
         });
     }
 
+    /// Asks for a URL and downloads it into the current folder.
+    fn download_file(self: &Rc<Self>) {
+        let Some(dir) = self.current_dir() else {
+            self.toast("Downloads need a real folder — open one first");
+            return;
+        };
+
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let Some((probe, into)) = dialogs::ask_download(&this.widget(), &dir).await else {
+                return;
+            };
+
+            // Never silently replace something already there.
+            let dest = ops::unique_destination(&into.join(&probe.filename));
+            let name = dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            let job = crate::fs::download::start(probe, dest);
+            let outcome = this.run_job(job, format!("Downloading {name}")).await;
+
+            if let Some((_, error)) = outcome.errors.first() {
+                dialogs::show_error(&this.widget(), "Download failed", error);
+            } else if !outcome.cancelled {
+                this.toast(&format!(
+                    "Downloaded {name} ({})",
+                    humansize::format_size(outcome.bytes_done, humansize::DECIMAL)
+                ));
+            }
+
+            this.reload();
+            let created = outcome.created.clone();
+            let weak = Rc::downgrade(&this);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                if let Some(this) = weak.upgrade() {
+                    this.view().select_paths(&created);
+                }
+            });
+        });
+    }
+
+    /// Stores the accent, restyles the running window, and moves the selected
+    /// marker to whichever swatch now matches.
+    fn set_accent(self: &Rc<Self>, hex: &str, swatches: &gtk::Box) {
+        let hex = crate::ui::accent::normalise(hex);
+        self.config.borrow_mut().accent_color = hex.clone();
+        crate::app::load_stylesheet(&hex);
+        self.schedule_save();
+
+        let mut child = swatches.first_child();
+        let mut index = 0;
+        while let Some(widget) = child {
+            let matches = crate::ui::accent::PRESETS
+                .get(index)
+                .is_some_and(|(_, preset)| hex.eq_ignore_ascii_case(preset));
+            if matches {
+                widget.add_css_class("accent-swatch-selected");
+            } else {
+                widget.remove_css_class("accent-swatch-selected");
+            }
+            child = widget.next_sibling();
+            index += 1;
+        }
+    }
+
     /// Runs a job on the progress strip and resolves with its outcome.
     ///
     /// `JobMonitor::run` is callback-shaped, which is fine for fire-and-forget
@@ -727,7 +866,7 @@ impl Window {
         let weak = Rc::downgrade(self);
         glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
             if let Some(this) = weak.upgrade() {
-                this.view.select_paths(&created);
+                this.view().select_paths(&created);
             }
         });
     }
@@ -788,7 +927,7 @@ impl Window {
             self.toast("Restore only works inside the Trash");
             return;
         }
-        let paths = self.view.selected_paths();
+        let paths = self.view().selected_paths();
         if paths.is_empty() {
             self.toast("Select items to restore");
             return;
@@ -885,16 +1024,24 @@ impl Window {
     pub(crate) fn mount_volume(self: &Rc<Self>, volume: Volume) {
         let this = Rc::clone(self);
         glib::spawn_future_local(async move {
+            if volume.is_encrypted {
+                this.unlock_volume(volume).await;
+                return;
+            }
             this.toast(&format!("Mounting “{}”…", volume.label));
 
+            let prefer_fuse = this.prefers_fuse(&volume);
             let result = run_off_thread({
                 let volume = volume.clone();
-                move || crate::drives::mount(&volume)
+                move || crate::drives::mount(&volume, prefer_fuse)
             })
             .await;
 
             match result {
-                Ok(path) => this.after_mount(&volume, path),
+                Ok(mounted) => {
+                    this.remember_mount_driver(&volume, mounted.used_fuse);
+                    this.after_mount(&volume, mounted.path);
+                }
                 Err(MountError::AlreadyMounted(path)) => this.after_mount(&volume, path),
                 Err(MountError::NtfsUnclean { message, hibernated }) => {
                     this.recover_ntfs(volume, message, hibernated).await;
@@ -908,6 +1055,91 @@ impl Window {
                 }
             }
         });
+    }
+
+    /// Whether this volume has previously needed the FUSE driver.
+    fn prefers_fuse(&self, volume: &Volume) -> bool {
+        !volume.uuid.is_empty()
+            && self.config.borrow().ntfs_fuse_volumes.contains(&volume.uuid)
+    }
+
+    /// Records which driver mounted the volume, so the next attempt starts with
+    /// the one that worked and produces no failed UDisks2 job for the desktop
+    /// to report as an error.
+    fn remember_mount_driver(self: &Rc<Self>, volume: &Volume, used_fuse: bool) {
+        if volume.uuid.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut config = self.config.borrow_mut();
+            let known = config.ntfs_fuse_volumes.contains(&volume.uuid);
+            match (used_fuse, known) {
+                (true, false) => {
+                    config.ntfs_fuse_volumes.push(volume.uuid.clone());
+                    true
+                }
+                // It mounts with the kernel driver again — perhaps Windows shut
+                // down cleanly this time — so stop preferring the slower one.
+                (false, true) => {
+                    config.ntfs_fuse_volumes.retain(|uuid| *uuid != volume.uuid);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            self.schedule_save();
+        }
+    }
+
+    /// Asks for the passphrase, unlocks the container, and mounts what is
+    /// inside it.
+    ///
+    /// Re-prompts on a wrong passphrase rather than making the user start over
+    /// from the sidebar; unlocking is non-destructive, so a failed attempt has
+    /// cost nothing. The passphrase lives only for the duration of the call.
+    async fn unlock_volume(self: &Rc<Self>, volume: Volume) {
+        let mut retry = false;
+
+        loop {
+            let Some(passphrase) =
+                dialogs::ask_passphrase(&self.widget(), &volume.label, retry).await
+            else {
+                return;
+            };
+
+            self.toast(&format!("Unlocking “{}”…", volume.label));
+            let prefer_fuse = self.prefers_fuse(&volume);
+            let result = run_off_thread({
+                let volume = volume.clone();
+                move || crate::drives::unlock_and_mount(&volume, &passphrase, prefer_fuse)
+            })
+            .await;
+
+            match result {
+                Ok(mounted) => {
+                    self.remember_mount_driver(&volume, mounted.used_fuse);
+                    self.after_mount(&volume, mounted.path);
+                    return;
+                }
+                Err(MountError::WrongPassphrase) => {
+                    retry = true;
+                    continue;
+                }
+                Err(MountError::NtfsUnclean { message, hibernated }) => {
+                    self.recover_ntfs(volume, message, hibernated).await;
+                    return;
+                }
+                Err(err) => {
+                    dialogs::show_error(
+                        &self.widget(),
+                        &format!("Could not unlock “{}”", volume.label),
+                        &err.message(),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     async fn recover_ntfs(self: &Rc<Self>, volume: Volume, message: String, hibernated: bool) {
@@ -933,7 +1165,10 @@ impl Window {
                 self.toast("Repairing the volume…");
                 run_off_thread({
                     let volume = volume.clone();
-                    move || crate::drives::repair_and_mount(&volume)
+                    // A repaired volume should be clean again, so the kernel
+                    // driver gets first go and the mapping is re-learned from
+                    // whichever one actually works.
+                    move || crate::drives::repair_and_mount(&volume).map(|m| m.path)
                 })
                 .await
             }
@@ -990,7 +1225,7 @@ impl Window {
                 && this.current_dir().is_some_and(|d| d.starts_with(mount_point))
             {
                 let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-                this.history.borrow_mut().forget(mount_point);
+                this.tab().history.borrow_mut().forget(mount_point);
                 this.navigate_to(Location::Directory(home), false);
             }
 
@@ -1268,6 +1503,82 @@ impl Window {
         shredding.add(&passes);
         page.add(&shredding);
 
+        let appearance = adw::PreferencesGroup::builder()
+            .title("Accent")
+            .description("Used for selection, focus and the drive meters.")
+            .build();
+
+        let swatches = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::Center)
+            .margin_top(6)
+            .margin_bottom(6)
+            .build();
+
+        let current = self.config.borrow().accent_color.clone();
+        for (index, (name, hex)) in crate::ui::accent::PRESETS.iter().enumerate() {
+            let button = gtk::Button::builder()
+                .tooltip_text(*name)
+                .width_request(30)
+                .height_request(30)
+                .css_classes(["accent-swatch", "circular", &crate::ui::accent::swatch_class(index)])
+                .build();
+            if current.eq_ignore_ascii_case(hex) {
+                button.add_css_class("accent-swatch-selected");
+            }
+
+            let weak = Rc::downgrade(self);
+            let hex = (*hex).to_string();
+            let swatches_ref = swatches.clone();
+            button.connect_clicked(move |_| {
+                let Some(this) = weak.upgrade() else { return };
+                this.set_accent(&hex, &swatches_ref);
+            });
+            swatches.append(&button);
+        }
+        // Wrapped in a row so the swatches sit inside the group's card rather
+        // than floating loose beneath it.
+        let swatch_row = adw::PreferencesRow::builder()
+            .activatable(false)
+            .selectable(false)
+            .child(&swatches)
+            .build();
+        appearance.add(&swatch_row);
+
+        let custom = adw::ActionRow::builder()
+            .title("Custom")
+            .subtitle("Any colour you like")
+            .build();
+        let picker = gtk::ColorDialogButton::builder()
+            .dialog(&gtk::ColorDialog::new())
+            .valign(gtk::Align::Center)
+            .build();
+        if let Some((r, g, b)) = crate::ui::accent::parse(&current) {
+            picker.set_rgba(&gdk::RGBA::new(
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+                1.0,
+            ));
+        }
+        let weak = Rc::downgrade(self);
+        let swatches_ref = swatches.clone();
+        picker.connect_rgba_notify(move |button| {
+            let Some(this) = weak.upgrade() else { return };
+            let c = button.rgba();
+            let hex = format!(
+                "#{:02X}{:02X}{:02X}",
+                (c.red() * 255.0).round() as u8,
+                (c.green() * 255.0).round() as u8,
+                (c.blue() * 255.0).round() as u8
+            );
+            this.set_accent(&hex, &swatches_ref);
+        });
+        custom.add_suffix(&picker);
+        appearance.add(&custom);
+        page.add(&appearance);
+
         let performance = adw::PreferencesGroup::builder()
             .title("Performance")
             .description(
@@ -1304,7 +1615,7 @@ impl Window {
             let Some(this) = weak.upgrade() else { return };
             this.config.borrow_mut().thumbnail_max_bytes = (row.value() as u64) * 1024 * 1024;
             crate::ui::thumbs::clear();
-            this.view.refresh_items();
+            this.view().refresh_items();
             this.schedule_save();
         });
         thumbs_group.add(&max_mb);
@@ -1353,6 +1664,9 @@ impl Window {
             let has_archive = selection.iter().any(|e| !e.is_dir && archive::is_archive(&e.path));
 
             menu.item("Open", "win.open", Some("Return"));
+            if selection.iter().any(|entry| entry.is_dir) {
+                menu.item("Open in New Tab", "win.open-in-new-tab", None);
+            }
             if single && !selection[0].is_dir {
                 menu.item("Open With…", "win.open-with", None);
             }
@@ -1404,7 +1718,7 @@ impl Window {
 // ── free functions ─────────────────────────────────────────────────────────
 
 /// Runs a blocking closure on a worker thread and awaits its result.
-async fn run_off_thread<T, F>(work: F) -> T
+pub(crate) async fn run_off_thread<T, F>(work: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,

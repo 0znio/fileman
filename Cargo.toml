@@ -1,6 +1,6 @@
 [package]
 name = "fileman"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 description = "A fast, modern GTK4/libadwaita file manager"
@@ -33,6 +33,7 @@ libc = "0.2"
 urlencoding = "2.1"
 shell-words = "1.1"
 async-channel = "2.5"
+ureq = { version = "3.4.1", features = ["rustls"] }
 
 [profile.release]
 opt-level = 3

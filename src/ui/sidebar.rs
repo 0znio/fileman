@@ -43,9 +43,14 @@ enum Target {
     Path(PathBuf),
     Trash,
     Recent,
-    /// Mounted network shares, which gvfs bridges into the filesystem.
-    Network,
     Volume(Box<Volume>),
+    /// A saved server. Clicking mounts it if it isn't already.
+    Server(Box<crate::fs::remote::Server>),
+    /// A cloud account. Clicking mounts it if it isn't already.
+    Cloud(Box<crate::fs::cloud::Account>),
+    /// The rows that open the two "add" dialogs.
+    ConnectServer,
+    AddCloud,
 }
 
 pub struct Sidebar {
@@ -57,12 +62,24 @@ pub struct Sidebar {
     rows: RefCell<Vec<(gtk::ListBoxRow, Target)>>,
     volumes: RefCell<Vec<Volume>>,
     favourites: RefCell<Vec<PathBuf>>,
+    servers: RefCell<Vec<crate::fs::remote::Server>>,
+    /// Cloud accounts as of the last refresh. Rebuilt from rclone rather than
+    /// stored, so a remote added outside Fileman still shows up.
+    cloud: RefCell<Vec<crate::fs::cloud::Account>>,
     trash_count: RefCell<usize>,
 
     on_navigate: Callback<PathBuf>,
     on_open_trash: RefCell<Option<Rc<dyn Fn()>>>,
     on_open_recent: RefCell<Option<Rc<dyn Fn()>>>,
     on_mount: Callback<Volume>,
+    on_connect_server: RefCell<Option<Rc<dyn Fn()>>>,
+    on_add_cloud: RefCell<Option<Rc<dyn Fn()>>>,
+    on_open_server: Callback<crate::fs::remote::Server>,
+    on_disconnect_server: Callback<crate::fs::remote::Server>,
+    on_forget_server: Callback<crate::fs::remote::Server>,
+    on_open_cloud: Callback<crate::fs::cloud::Account>,
+    on_disconnect_cloud: Callback<crate::fs::cloud::Account>,
+    on_forget_cloud: Callback<crate::fs::cloud::Account>,
     on_unmount: Callback<Volume>,
     on_eject: Callback<Volume>,
     on_favourite_added: Callback<PathBuf>,
@@ -92,11 +109,21 @@ impl Sidebar {
             rows: RefCell::new(Vec::new()),
             volumes: RefCell::new(Vec::new()),
             favourites: RefCell::new(Vec::new()),
+            servers: RefCell::new(Vec::new()),
+            cloud: RefCell::new(Vec::new()),
             trash_count: RefCell::new(0),
             on_navigate: RefCell::new(None),
             on_open_trash: RefCell::new(None),
             on_open_recent: RefCell::new(None),
             on_mount: RefCell::new(None),
+            on_connect_server: RefCell::new(None),
+            on_add_cloud: RefCell::new(None),
+            on_open_server: RefCell::new(None),
+            on_disconnect_server: RefCell::new(None),
+            on_forget_server: RefCell::new(None),
+            on_open_cloud: RefCell::new(None),
+            on_disconnect_cloud: RefCell::new(None),
+            on_forget_cloud: RefCell::new(None),
             on_unmount: RefCell::new(None),
             on_eject: RefCell::new(None),
             on_favourite_added: RefCell::new(None),
@@ -120,6 +147,30 @@ impl Sidebar {
     }
     pub fn connect_mount(&self, f: impl Fn(Volume) + 'static) {
         *self.on_mount.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_connect_server(&self, f: impl Fn() + 'static) {
+        *self.on_connect_server.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_add_cloud(&self, f: impl Fn() + 'static) {
+        *self.on_add_cloud.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_open_server(&self, f: impl Fn(crate::fs::remote::Server) + 'static) {
+        *self.on_open_server.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_disconnect_server(&self, f: impl Fn(crate::fs::remote::Server) + 'static) {
+        *self.on_disconnect_server.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_forget_server(&self, f: impl Fn(crate::fs::remote::Server) + 'static) {
+        *self.on_forget_server.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_open_cloud(&self, f: impl Fn(crate::fs::cloud::Account) + 'static) {
+        *self.on_open_cloud.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_disconnect_cloud(&self, f: impl Fn(crate::fs::cloud::Account) + 'static) {
+        *self.on_disconnect_cloud.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn connect_forget_cloud(&self, f: impl Fn(crate::fs::cloud::Account) + 'static) {
+        *self.on_forget_cloud.borrow_mut() = Some(Rc::new(f));
     }
     pub fn connect_unmount(&self, f: impl Fn(Volume) + 'static) {
         *self.on_unmount.borrow_mut() = Some(Rc::new(f));
@@ -147,6 +198,20 @@ impl Sidebar {
         self.rebuild();
     }
 
+    pub fn set_servers(self: &Rc<Self>, servers: Vec<crate::fs::remote::Server>) {
+        *self.servers.borrow_mut() = servers;
+        self.rebuild();
+    }
+
+    /// Re-reads cloud accounts and their mount state.
+    ///
+    /// This shells out to rclone, so it is called on the events that can change
+    /// the answer rather than on every rebuild.
+    pub fn refresh_cloud(self: &Rc<Self>) {
+        *self.cloud.borrow_mut() = crate::fs::cloud::accounts();
+        self.rebuild();
+    }
+
     pub fn set_trash_count(self: &Rc<Self>, count: usize) {
         if *self.trash_count.borrow() == count {
             return;
@@ -158,15 +223,21 @@ impl Sidebar {
     /// Highlights the row matching `path`, if any.
     pub fn set_current(&self, path: &Path) {
         *self.current.borrow_mut() = path.to_path_buf();
+        // Asking gvfs what is mounted is a D-Bus round trip, and this runs on
+        // every navigation. It is fetched once, and only if a server row is
+        // actually present to need it.
+        let mut shares: Option<Vec<crate::fs::remote::Mounted>> = None;
+
         for (row, target) in self.rows.borrow().iter() {
             let active = match target {
                 Target::Path(p) => p == path,
                 Target::Volume(v) => v.mount_point.as_deref() == Some(path),
-                // Network resolves to a real directory, so it highlights like
-                // any other path; Trash and Recent have none and are selected
-                // by the window instead.
-                Target::Network => crate::fs::recent::network_root().as_deref() == Some(path),
-                Target::Trash | Target::Recent => false,
+                Target::Server(server) => shares
+                    .get_or_insert_with(crate::fs::remote::mounted)
+                    .iter()
+                    .any(|m| m.uri == server.uri() && m.path.as_deref() == Some(path)),
+                Target::Cloud(account) => account.mounted && account.mount_point == path,
+                Target::Trash | Target::Recent | Target::ConnectServer | Target::AddCloud => false,
             };
             let Some(list) = row.parent().and_downcast::<gtk::ListBox>() else { continue };
             if active {
@@ -191,6 +262,8 @@ impl Sidebar {
         self.build_favourites();
         self.build_system();
         self.build_devices();
+        self.build_network();
+        self.build_cloud();
 
         let current = self.current.borrow().clone();
         self.set_current(&current);
@@ -223,24 +296,6 @@ impl Sidebar {
             Target::Recent,
         );
         list.append(&recent);
-
-        let network = self.make_row("Network", "network-workgroup-symbolic", None, Target::Network);
-        // Say up front when there is nothing behind it, rather than opening an
-        // empty folder and leaving the user to guess why.
-        match crate::fs::recent::network_root() {
-            Some(root) if !crate::fs::recent::network_is_empty(&root) => {
-                network.set_tooltip_text(Some("Network shares mounted in this session"));
-            }
-            Some(_) => network
-                .set_tooltip_text(Some("No network shares are mounted yet")),
-            None => {
-                network.set_sensitive(false);
-                network.set_tooltip_text(Some(
-                    "Needs gvfs, which provides network browsing for the desktop",
-                ));
-            }
-        }
-        list.append(&network);
 
         let count = *self.trash_count.borrow();
         let badge = (count > 0).then(|| count.to_string());
@@ -306,6 +361,159 @@ impl Sidebar {
         }
     }
 
+    /// Saved servers, whatever is mounted right now, and the way to add more.
+    ///
+    /// Saved and mounted are deliberately one list rather than two: to the user
+    /// "my NAS" is one thing whose state changes, and splitting it means the
+    /// same share appears twice as soon as it is connected.
+    fn build_network(self: &Rc<Self>) {
+        let list = self.new_section(Some("Network"));
+        let mounted = crate::fs::remote::mounted();
+        let servers = self.servers.borrow().clone();
+
+        for server in &servers {
+            let uri = server.uri();
+            let live = mounted.iter().find(|m| m.uri == uri);
+            let row = self.make_row(
+                &server.display_name(),
+                server.icon(),
+                live.is_some().then_some("●"),
+                Target::Server(Box::new(server.clone())),
+            );
+            row.set_tooltip_text(Some(&match live {
+                Some(_) => format!("{uri} — connected"),
+                None => format!("{uri} — click to connect"),
+            }));
+            self.attach_server_menu(&row, server, live.is_some());
+            list.append(&row);
+        }
+
+        // Anything mounted that was never saved — connected from another app,
+        // or from here without saving — still belongs in the list.
+        for share in &mounted {
+            if servers.iter().any(|s| s.uri() == share.uri) {
+                continue;
+            }
+            let Ok(server) = crate::fs::remote::parse_address(&share.uri, crate::fs::remote::Scheme::Smb)
+            else {
+                continue;
+            };
+            let row = self.make_row(
+                &share.name,
+                &share.icon,
+                Some("●"),
+                Target::Server(Box::new(server.clone())),
+            );
+            row.set_tooltip_text(Some(&format!("{} — connected", share.uri)));
+            self.attach_server_menu(&row, &server, true);
+            list.append(&row);
+        }
+
+        let connect = self.make_row("Connect to Server…", "list-add-symbolic", None, Target::ConnectServer);
+        connect.set_tooltip_text(Some("SMB, SFTP, FTP, WebDAV or NFS"));
+        list.append(&connect);
+    }
+
+    /// Cloud accounts, one row each, named by who they signed in as.
+    ///
+    /// The identity is in the label rather than a tooltip because two Google
+    /// Drives are otherwise indistinguishable, and picking the wrong one is a
+    /// mistake that is noticed much later.
+    fn build_cloud(self: &Rc<Self>) {
+        let accounts = self.cloud.borrow().clone();
+        if accounts.is_empty() && !crate::fs::cloud::is_available() {
+            // Nothing configured and no rclone: one row that explains itself
+            // beats an empty section.
+            let list = self.new_section(Some("Cloud"));
+            let row = self.make_row("Add Cloud Drive…", "list-add-symbolic", None, Target::AddCloud);
+            row.set_tooltip_text(Some("Needs rclone, which handles the sign-in"));
+            list.append(&row);
+            return;
+        }
+
+        let list = self.new_section(Some("Cloud"));
+        for account in &accounts {
+            let row = self.make_row(
+                &account.display_name(),
+                account.provider.icon(),
+                account.mounted.then_some("●"),
+                Target::Cloud(Box::new(account.clone())),
+            );
+            row.set_tooltip_text(Some(&if account.mounted {
+                format!("Connected at {}", account.mount_point.display())
+            } else {
+                "Click to connect".to_string()
+            }));
+            self.attach_cloud_menu(&row, account);
+            list.append(&row);
+        }
+
+        let add = self.make_row("Add Cloud Drive…", "list-add-symbolic", None, Target::AddCloud);
+        add.set_tooltip_text(Some("Google Drive, Proton Drive, Icedrive and others"));
+        list.append(&add);
+    }
+
+    /// Right-click on a saved server: edit or forget it.
+    fn attach_server_menu(
+        self: &Rc<Self>,
+        row: &gtk::ListBoxRow,
+        server: &crate::fs::remote::Server,
+        connected: bool,
+    ) {
+        let menu = gio::Menu::new();
+        if connected {
+            menu.append(Some("Disconnect"), Some("server.disconnect"));
+        }
+        // Forgetting is about the sidebar entry, not the connection, so it is
+        // offered whether or not the share is mounted.
+        menu.append(Some("Forget This Server"), Some("server.forget"));
+
+        let actions = gio::SimpleActionGroup::new();
+        for name in ["disconnect", "forget"] {
+            let action = gio::SimpleAction::new(name, None);
+            let (weak, server, disconnect) =
+                (Rc::downgrade(self), server.clone(), name == "disconnect");
+            action.connect_activate(move |_, _| {
+                let Some(this) = weak.upgrade() else { return };
+                if disconnect {
+                    emit(&this.on_disconnect_server, server.clone());
+                } else {
+                    emit(&this.on_forget_server, server.clone());
+                }
+            });
+            actions.add_action(&action);
+        }
+        row.insert_action_group("server", Some(&actions));
+        attach_menu_gesture(row, menu);
+    }
+
+    /// Right-click on a cloud account: disconnect, or remove it entirely.
+    fn attach_cloud_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, account: &crate::fs::cloud::Account) {
+        let menu = gio::Menu::new();
+        if account.mounted {
+            menu.append(Some("Disconnect"), Some("cloud.disconnect"));
+        }
+        menu.append(Some("Remove Account"), Some("cloud.forget"));
+
+        let actions = gio::SimpleActionGroup::new();
+        for name in ["disconnect", "forget"] {
+            let action = gio::SimpleAction::new(name, None);
+            let (weak, account, disconnect) =
+                (Rc::downgrade(self), account.clone(), name == "disconnect");
+            action.connect_activate(move |_, _| {
+                let Some(this) = weak.upgrade() else { return };
+                if disconnect {
+                    emit(&this.on_disconnect_cloud, account.clone());
+                } else {
+                    emit(&this.on_forget_cloud, account.clone());
+                }
+            });
+            actions.add_action(&action);
+        }
+        row.insert_action_group("cloud", Some(&actions));
+        attach_menu_gesture(row, menu);
+    }
+
     /// Adds a titled section and returns its list box.
     fn new_section(self: &Rc<Self>, title: Option<&str>) -> gtk::ListBox {
         if let Some(title) = title {
@@ -351,13 +559,17 @@ impl Sidebar {
             Some(Target::Recent) => {
                 emit_unit(&self.on_open_recent);
             }
-            // The row is insensitive without gvfs, so a missing root here only
-            // happens if the bridge stopped between building the row and the
-            // click; doing nothing is the right response either way.
-            Some(Target::Network) => {
-                if let Some(root) = crate::fs::recent::network_root() {
-                    self.navigate(root);
-                }
+            Some(Target::ConnectServer) => {
+                emit_unit(&self.on_connect_server);
+            }
+            Some(Target::AddCloud) => {
+                emit_unit(&self.on_add_cloud);
+            }
+            Some(Target::Server(server)) => {
+                emit(&self.on_open_server, *server);
+            }
+            Some(Target::Cloud(account)) => {
+                emit(&self.on_open_cloud, *account);
             }
             Some(Target::Volume(volume)) => match &volume.mount_point {
                 // Already mounted: just go there.

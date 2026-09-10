@@ -1015,6 +1015,288 @@ impl Window {
         });
     }
 
+
+    // ── network shares and cloud drives ────────────────────────────────────
+
+    /// Opens the connect dialog, mounts what it returns, and saves it.
+    ///
+    /// Saving happens on success rather than on submit, so a mistyped address
+    /// does not leave a permanently broken row in the sidebar.
+    pub(crate) fn connect_to_server(self: &Rc<Self>) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let Some(server) = crate::ui::connect::ask_server(&this.widget(), None).await else {
+                return;
+            };
+            if this.mount_server(&server).await {
+                this.save_server(server);
+            }
+        });
+    }
+
+    /// Mounts a saved server and navigates into it.
+    pub(crate) fn open_server(self: &Rc<Self>, server: crate::fs::remote::Server) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            this.mount_server(&server).await;
+        });
+    }
+
+    /// Mounts `server`, navigating on success. Returns whether it worked.
+    async fn mount_server(self: &Rc<Self>, server: &crate::fs::remote::Server) -> bool {
+        let uri = server.uri();
+        self.toast(&format!("Connecting to {}…", server.display_name()));
+
+        // The mount operation is what turns "authentication required" into a
+        // dialog. It must be parented at the window or the prompt appears
+        // behind it, which reads as the connection silently hanging.
+        let operation = gtk::MountOperation::new(Some(&self.window));
+        let result = crate::fs::remote::mount(&uri, operation.upcast_ref()).await;
+
+        match result {
+            Ok(path) => {
+                self.toast(&format!("Connected to {}", server.display_name()));
+                self.sidebar.set_servers(self.config.borrow().servers.clone());
+                self.open_path(path);
+                true
+            }
+            Err(message) => {
+                // A cancelled prompt is a decision, not a failure.
+                if message.contains("cancelled") {
+                    self.transient_toast("Connection cancelled");
+                } else {
+                    dialogs::show_error(
+                        &self.widget(),
+                        &format!("Could not connect to {}", server.display_name()),
+                        &message,
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn save_server(self: &Rc<Self>, server: crate::fs::remote::Server) {
+        {
+            let mut config = self.config.borrow_mut();
+            let uri = server.uri();
+            if !config.servers.iter().any(|s| s.uri() == uri) {
+                config.servers.push(server);
+            }
+        }
+        self.sidebar.set_servers(self.config.borrow().servers.clone());
+        self.schedule_save();
+    }
+
+    /// Disconnects a mounted share, leaving the saved address in place.
+    pub(crate) fn disconnect_server(self: &Rc<Self>, server: crate::fs::remote::Server) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            match crate::fs::remote::unmount(&server.uri()).await {
+                Ok(()) => {
+                    this.sidebar.set_servers(this.config.borrow().servers.clone());
+                    this.transient_toast(&format!("Disconnected {}", server.display_name()));
+                }
+                Err(message) => {
+                    dialogs::show_error(&this.widget(), "Could not disconnect", &message);
+                }
+            }
+        });
+    }
+
+    /// Removes a saved server. The share itself is left mounted if it is —
+    /// forgetting an address should not disconnect work in progress.
+    pub(crate) fn forget_server(self: &Rc<Self>, server: crate::fs::remote::Server) {
+        {
+            let mut config = self.config.borrow_mut();
+            let uri = server.uri();
+            config.servers.retain(|s| s.uri() != uri);
+        }
+        self.sidebar.set_servers(self.config.borrow().servers.clone());
+        self.schedule_save();
+        self.transient_toast(&format!("Forgot {}", server.display_name()));
+    }
+
+    /// Adds a cloud account, signing in whichever way the provider needs.
+    pub(crate) fn add_cloud_drive(self: &Rc<Self>) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let Some(details) = crate::ui::connect::ask_cloud(&this.widget()).await else {
+                return;
+            };
+            if details.provider.uses_oauth() {
+                this.add_cloud_via_browser(details).await;
+            } else {
+                this.add_cloud_with_password(details).await;
+            }
+        });
+    }
+
+    async fn add_cloud_with_password(self: &Rc<Self>, details: crate::fs::cloud::NewAccount) {
+        self.toast("Signing in…");
+        let result =
+            run_off_thread(move || crate::fs::cloud::connect_with_password(&details)).await;
+
+        match result {
+            Ok(account) => {
+                self.toast(&format!("Added {}", account.display_name()));
+                self.sidebar.refresh_cloud();
+                self.open_cloud(account);
+            }
+            Err(message) => {
+                dialogs::show_error(&self.widget(), "Could not add that account", &message);
+            }
+        }
+    }
+
+    /// Runs rclone's browser sign-in.
+    ///
+    /// This can take minutes — the user has to find the account, approve the
+    /// scopes, maybe pass a second factor — so it runs on a worker thread with
+    /// no timeout of our own, and the window stays usable throughout.
+    async fn add_cloud_via_browser(self: &Rc<Self>, details: crate::fs::cloud::NewAccount) {
+        let (program, args) = match crate::fs::cloud::oauth_command(&details) {
+            Ok(command) => command,
+            Err(message) => {
+                dialogs::show_error(&self.widget(), "Could not start the sign-in", &message);
+                return;
+            }
+        };
+        // The remote name is the last argument rclone was told to create, and
+        // it is needed afterwards to ask the provider who signed in.
+        let remote = args.get(2).cloned().unwrap_or_default();
+        self.toast("A browser will open for you to sign in…");
+
+        let result = run_off_thread(move || {
+            std::process::Command::new(program)
+                .args(&args)
+                .output()
+                .map_err(|e| format!("Could not run rclone: {e}"))
+                .and_then(|output| {
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+                    }
+                })
+        })
+        .await;
+
+        match result {
+            Ok(()) => {
+                let identity =
+                    run_off_thread({
+                        let remote = remote.clone();
+                        move || crate::fs::cloud::record_identity(&remote)
+                    })
+                    .await;
+                self.sidebar.refresh_cloud();
+                if identity.is_empty() {
+                    self.toast("Account added");
+                } else {
+                    self.toast(&format!("Added {identity}"));
+                }
+            }
+            Err(message) => {
+                let message = if message.is_empty() {
+                    "The sign-in did not complete.".to_string()
+                } else {
+                    message
+                };
+                dialogs::show_error(&self.widget(), "Sign-in did not finish", &message);
+            }
+        }
+    }
+
+    /// Mounts a cloud account if needed, then navigates into it.
+    pub(crate) fn open_cloud(self: &Rc<Self>, account: crate::fs::cloud::Account) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            if account.mounted {
+                this.open_path(account.mount_point.clone());
+                return;
+            }
+            this.toast(&format!("Connecting to {}…", account.display_name()));
+
+            let result = run_off_thread({
+                let account = account.clone();
+                move || crate::fs::cloud::mount(&account)
+            })
+            .await;
+
+            match result {
+                Ok(()) => {
+                    this.sidebar.refresh_cloud();
+                    this.open_path(account.mount_point.clone());
+                }
+                Err(message) => {
+                    dialogs::show_error(
+                        &this.widget(),
+                        &format!("Could not connect to {}", account.display_name()),
+                        &message,
+                    );
+                }
+            }
+        });
+    }
+
+    pub(crate) fn disconnect_cloud(self: &Rc<Self>, account: crate::fs::cloud::Account) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let result = run_off_thread({
+                let account = account.clone();
+                move || crate::fs::cloud::unmount(&account)
+            })
+            .await;
+
+            match result {
+                Ok(()) => {
+                    this.sidebar.refresh_cloud();
+                    this.transient_toast(&format!("Disconnected {}", account.display_name()));
+                }
+                Err(message) => {
+                    dialogs::show_error(&this.widget(), "Could not disconnect", &message);
+                }
+            }
+        });
+    }
+
+    /// Removes a cloud account entirely, including its stored sign-in.
+    ///
+    /// Confirmed first because it deletes credentials: reconnecting means going
+    /// through the whole browser sign-in again.
+    pub(crate) fn forget_cloud(self: &Rc<Self>, account: crate::fs::cloud::Account) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let confirmed = dialogs::confirm(
+                &this.widget(),
+                &format!("Remove {}?", account.display_name()),
+                "The sign-in is deleted from rclone. Nothing in the cloud account itself \
+                 is touched, but you will have to sign in again to use it here.",
+                "Remove",
+                true,
+            )
+            .await;
+            if !confirmed {
+                return;
+            }
+
+            let result = run_off_thread({
+                let remote = account.remote.clone();
+                move || crate::fs::cloud::forget(&remote)
+            })
+            .await;
+
+            this.sidebar.refresh_cloud();
+            match result {
+                Ok(()) => this.transient_toast(&format!("Removed {}", account.display_name())),
+                Err(message) => {
+                    dialogs::show_error(&this.widget(), "Could not remove that account", &message)
+                }
+            }
+        });
+    }
+
     // ── drives ─────────────────────────────────────────────────────────────
 
     /// Mounts a volume, then navigates into it.

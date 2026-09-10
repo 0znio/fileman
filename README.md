@@ -92,7 +92,19 @@ Create zip, tar.gz, tar.xz, tar.zst, 7z.
 
 **Downloads** — `Ctrl+Shift+D` takes a URL, asks the server for the real name and
 size, lets you rename and pick a folder, then fetches it across several
-connections.
+connections. Share links from Google Drive, pixeldrain, GitHub, Dropbox and
+gofile are rewritten to the file they point at, and a reply that turns out to be
+a login page or an ISP block is reported instead of being saved as your `.zip`.
+
+**Network shares** — connect to SMB, SFTP, FTP, WebDAV or NFS from the sidebar.
+Saved servers stay listed whether or not they're mounted; passwords go to your
+login keyring through gvfs, never to Fileman.
+
+**Cloud drives** — Google Drive, Proton Drive, Icedrive, Dropbox, OneDrive and
+Nextcloud, mounted as ordinary folders so copy, search and compress all work on
+them. Each account is listed with the address it signed in as, so two Google
+Drives stay apart. Needs [rclone](https://rclone.org), which holds the
+credentials.
 
 **Deleting** — Trash by default and undoable. `Shift+Delete` is permanent;
 `Ctrl+Shift+Delete` shreds, and tells you when your filesystem makes that
@@ -214,9 +226,9 @@ widget.
 ## Known gaps
 
 No split view · renaming several files at once · video and document thumbnails ·
-search matches names, not contents · Network shows what gvfs has already mounted,
-it can't connect to a new `smb://` server · not yet a desktop file-chooser
-backend, so browsers still use the GTK save dialog.
+search matches names, not contents · each network protocol needs its own gvfs
+backend installed, and the connect dialog says which · not yet a desktop
+file-chooser backend, so browsers still use the GTK save dialog.
 
 ## Licence
 

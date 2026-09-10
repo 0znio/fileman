@@ -54,39 +54,3 @@ pub fn list() -> Vec<RecentItem> {
 pub fn clear() {
     let _ = gtk::RecentManager::default().purge_items();
 }
-
-/// Where gvfs exposes mounted network shares as ordinary directories.
-///
-/// gvfs mounts `smb://`, `sftp://` and friends inside the session and bridges
-/// them into the filesystem here, so a path-based file manager can browse them
-/// with no URI backend of its own. `None` when the bridge is not running, which
-/// is the honest answer — there is nothing to show.
-pub fn network_root() -> Option<PathBuf> {
-    // SAFETY: `getuid` cannot fail and touches no memory we own.
-    let uid = unsafe { libc::getuid() };
-    let path = PathBuf::from(format!("/run/user/{uid}/gvfs"));
-    path.is_dir().then_some(path)
-}
-
-/// True when the network root exists but has nothing mounted in it.
-pub fn network_is_empty(root: &std::path::Path) -> bool {
-    std::fs::read_dir(root).map(|mut d| d.next().is_none()).unwrap_or(true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_empty_network_root_is_reported_as_empty() {
-        let dir = crate::testing::TempDir::new("network");
-        assert!(network_is_empty(dir.path()));
-        std::fs::create_dir(dir.join("share")).unwrap();
-        assert!(!network_is_empty(dir.path()));
-    }
-
-    #[test]
-    fn a_missing_network_root_is_also_empty() {
-        assert!(network_is_empty(std::path::Path::new("/nonexistent-gvfs-root")));
-    }
-}

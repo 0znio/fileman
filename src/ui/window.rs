@@ -368,6 +368,10 @@ impl Window {
         this.watch_drive_changes();
         this.refresh_trash_count();
         this.sidebar.set_favourites(this.config.borrow().favourites.clone());
+        this.sidebar.set_servers(this.config.borrow().servers.clone());
+        // Reads rclone's config, which is a subprocess; done once at startup
+        // and then only when something could have changed it.
+        this.sidebar.refresh_cloud();
         this.navigate_to(Location::Directory(start), false);
 
         this
@@ -459,6 +463,62 @@ impl Window {
         self.sidebar.connect_eject(move |volume| {
             if let Some(this) = weak.upgrade() {
                 this.unmount_volume(volume, true);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_connect_server(move || {
+            if let Some(this) = weak.upgrade() {
+                this.connect_to_server();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_open_server(move |server| {
+            if let Some(this) = weak.upgrade() {
+                this.open_server(server);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_disconnect_server(move |server| {
+            if let Some(this) = weak.upgrade() {
+                this.disconnect_server(server);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_forget_server(move |server| {
+            if let Some(this) = weak.upgrade() {
+                this.forget_server(server);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_add_cloud(move || {
+            if let Some(this) = weak.upgrade() {
+                this.add_cloud_drive();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_open_cloud(move |account| {
+            if let Some(this) = weak.upgrade() {
+                this.open_cloud(account);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_disconnect_cloud(move |account| {
+            if let Some(this) = weak.upgrade() {
+                this.disconnect_cloud(account);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_forget_cloud(move |account| {
+            if let Some(this) = weak.upgrade() {
+                this.forget_cloud(account);
             }
         });
 

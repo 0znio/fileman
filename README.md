@@ -28,6 +28,11 @@ prebuilt binary — or builds from source if a binary won't run here.
 > Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch, openSUSE Tumbleweed.
 > Older, musl, or non-x86_64 builds from source instead.
 
+The installer also pulls the optional pieces each feature needs: `gvfs` and
+`gvfs-smb` for network shares, `rclone` and `fuse3` for cloud drives, `ntfs-3g`
+for NTFS repair, and `pigz` for fast `.tar.gz`. Everything else still works
+without them, and the app says which one is missing rather than failing quietly.
+
 Options go after `-s --`, since the script is piped into `sh`:
 
 ```sh
@@ -102,9 +107,9 @@ login keyring through gvfs, never to Fileman.
 
 **Cloud drives** — Google Drive, Proton Drive, Icedrive, Dropbox, OneDrive and
 Nextcloud, mounted as ordinary folders so copy, search and compress all work on
-them. Each account is listed with the address it signed in as, so two Google
-Drives stay apart. Needs [rclone](https://rclone.org), which holds the
-credentials.
+them. Each account is labelled with the name you give it, so several accounts of
+one provider stay apart. Needs [rclone](https://rclone.org), which holds the
+credentials — Fileman never sees them.
 
 **Deleting** — Trash by default and undoable. `Shift+Delete` is permanent;
 `Ctrl+Shift+Delete` shreds, and tells you when your filesystem makes that

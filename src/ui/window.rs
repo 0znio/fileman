@@ -369,9 +369,9 @@ impl Window {
         this.refresh_trash_count();
         this.sidebar.set_favourites(this.config.borrow().favourites.clone());
         this.sidebar.set_servers(this.config.borrow().servers.clone());
-        // Reads rclone's config, which is a subprocess; done once at startup
-        // and then only when something could have changed it.
-        this.sidebar.refresh_cloud();
+        // Runs rclone, so it happens off-thread and fills the section in once
+        // the window is already up.
+        this.refresh_cloud();
         this.navigate_to(Location::Directory(start), false);
 
         this

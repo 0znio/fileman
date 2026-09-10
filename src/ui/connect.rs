@@ -228,7 +228,7 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
         .build();
 
     let name = gtk::Entry::builder()
-        .placeholder_text("Work drive")
+        .placeholder_text("you@gmail.com, or “Work drive”")
         .activates_default(true)
         .hexpand(true)
         .build();
@@ -252,11 +252,26 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
         .activates_default(true)
         .hexpand(true)
         .build();
+    let client_id = gtk::Entry::builder()
+        .placeholder_text("Optional")
+        .activates_default(true)
+        .hexpand(true)
+        .build();
+    let client_secret = gtk::Entry::builder()
+        .placeholder_text("Optional")
+        .activates_default(true)
+        .hexpand(true)
+        .build();
 
     let group = adw::PreferencesGroup::new();
     let provider_row = adw::ActionRow::builder().title("Provider").build();
     provider_row.add_suffix(&provider);
-    let name_row = adw::ActionRow::builder().title("Name").build();
+    // Not decoration: Google Drive cannot tell us which account signed in, so
+    // this is the only thing distinguishing two of them in the sidebar.
+    let name_row = adw::ActionRow::builder()
+        .title("Name")
+        .subtitle("How this account is labelled")
+        .build();
     name_row.add_suffix(&name);
     let username_row = adw::ActionRow::builder().title("Email or username").build();
     username_row.add_suffix(&username);
@@ -266,7 +281,26 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
     totp_row.add_suffix(&totp);
     let url_row = adw::ActionRow::builder().title("WebDAV address").build();
     url_row.add_suffix(&url);
-    for row in [&provider_row, &name_row, &username_row, &password_row, &totp_row, &url_row] {
+    // Google is retiring the client ID rclone ships, and shares its rate limit
+    // between every rclone user until then. Optional, but the row explains why
+    // somebody would want to fill it in.
+    let client_id_row = adw::ActionRow::builder()
+        .title("Client ID")
+        .subtitle("Your own OAuth app — avoids rclone's shared, rate-limited one")
+        .build();
+    client_id_row.add_suffix(&client_id);
+    let client_secret_row = adw::ActionRow::builder().title("Client secret").build();
+    client_secret_row.add_suffix(&client_secret);
+    for row in [
+        &provider_row,
+        &name_row,
+        &username_row,
+        &password_row,
+        &totp_row,
+        &url_row,
+        &client_id_row,
+        &client_secret_row,
+    ] {
         group.add(row);
     }
 
@@ -324,6 +358,8 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
             status.clone(),
             accept.clone(),
         );
+        let (client_id_row, client_secret_row) =
+            (client_id_row.clone(), client_secret_row.clone());
         let providers = providers.clone();
         let provider_widget = provider.clone();
         Rc::new(move || {
@@ -336,10 +372,14 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
             password_row.set_visible(!oauth);
             totp_row.set_visible(chosen == Provider::ProtonDrive);
             url_row.set_visible(chosen == Provider::Nextcloud || chosen == Provider::Other);
+            client_id_row.set_visible(oauth);
+            client_secret_row.set_visible(oauth);
             accept.set_label(if oauth { "Sign in with browser" } else { "Connect" });
             status.remove_css_class("error");
             status.set_label(if oauth {
-                "A browser window will open so you can sign in. Fileman never sees the password."
+                "A browser window will open so you can sign in. Fileman never sees the \
+                 password. Google Drive does not report which account signed in, so the \
+                 name above is what tells two of them apart — your email works well."
             } else {
                 "The password is stored by rclone, not by Fileman."
             });
@@ -350,6 +390,17 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
         provider.connect_selected_notify(move |_| update_fields());
     }
     update_fields();
+
+    // An unnamed account is indistinguishable from the next one of the same
+    // provider, so there is nothing useful to create without a name.
+    {
+        let accept = accept.clone();
+        let set = move |entry: &gtk::Entry| {
+            accept.set_sensitive(!entry.text().trim().is_empty());
+        };
+        set(&name);
+        name.connect_changed(move |entry| set(entry));
+    }
 
     let confirmed = run(&dialog, parent, &accept, &cancel, &name).await;
     if !confirmed {
@@ -364,6 +415,8 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
         password: password.text().to_string(),
         totp: totp.text().to_string(),
         url: url.text().to_string(),
+        client_id: client_id.text().to_string(),
+        client_secret: client_secret.text().to_string(),
     })
 }
 

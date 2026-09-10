@@ -210,14 +210,14 @@ FAMILY=$(family)
 # Runtime first, then the extras needed only to compile.
 runtime_packages() {
     case "$FAMILY" in
-        arch)   echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz" ;;
-        debian) echo "libgtk-4-1 libadwaita-1-0 libarchive13t64 udisks2 ntfs-3g pigz" ;;
-        fedora) echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz" ;;
-        suse)   echo "gtk4 libadwaita-1-0 libarchive13 udisks2 ntfs-3g pigz" ;;
-        alpine) echo "gtk4.0 libadwaita libarchive udisks2 ntfs-3g pigz" ;;
-        void)   echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz" ;;
-        gentoo) echo "gui-libs/gtk gui-libs/libadwaita app-arch/libarchive sys-fs/udisks sys-fs/ntfs3g app-arch/pigz" ;;
-        solus)  echo "libgtk-4 libadwaita libarchive udisks2 ntfs-3g pigz" ;;
+        arch)   echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb gvfs-nfs rclone fuse3" ;;
+        debian) echo "libgtk-4-1 libadwaita-1-0 libarchive13t64 udisks2 ntfs-3g pigz gvfs gvfs-backends gvfs-fuse rclone fuse3" ;;
+        fedora) echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb gvfs-nfs gvfs-fuse rclone fuse3" ;;
+        suse)   echo "gtk4 libadwaita-1-0 libarchive13 udisks2 ntfs-3g pigz gvfs gvfs-backend-samba gvfs-fuse rclone fuse3" ;;
+        alpine) echo "gtk4.0 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb rclone fuse3" ;;
+        void)   echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb rclone fuse3" ;;
+        gentoo) echo "gui-libs/gtk gui-libs/libadwaita app-arch/libarchive sys-fs/udisks sys-fs/ntfs3g app-arch/pigz gnome-base/gvfs net-misc/rclone sys-fs/fuse" ;;
+        solus)  echo "libgtk-4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs rclone fuse3" ;;
         *)      echo "" ;;
     esac
 }
@@ -264,6 +264,7 @@ install_deps() {
         warn "unrecognised distro — install these yourself:"
         warn "  gtk4 (>= $MIN_GTK), libadwaita (>= $MIN_ADW), libarchive, udisks2"
         warn "  optional: ntfs-3g (NTFS repair), pigz (fast .tar.gz)"
+        warn "  optional: gvfs + gvfs-smb (network shares), rclone + fuse3 (cloud drives)"
         return 0
     fi
 
@@ -480,5 +481,11 @@ esac
 
 have pigz    || warn "pigz not installed — .tar.gz creation stays single-threaded"
 have ntfsfix || warn "ntfs-3g not installed — NTFS repair will be unavailable"
+have rclone  || warn "rclone not installed — cloud drives will be unavailable"
+# Cloud drives are FUSE mounts, so the unmount helper is as required as rclone.
+have fusermount3 || have fusermount || \
+    warn "fuse3 not installed — cloud drives cannot be mounted"
+[ -f /usr/share/gvfs/mounts/smb.mount ] || \
+    warn "gvfs-smb not installed — Windows network shares will be unavailable"
 
 printf '\n  Run it with: %sfileman%s [path]\n\n' "$B" "$R"

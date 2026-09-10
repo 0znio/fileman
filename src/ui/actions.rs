@@ -1117,6 +1117,19 @@ impl Window {
         self.transient_toast(&format!("Forgot {}", server.display_name()));
     }
 
+    /// Re-reads cloud accounts off the main thread and updates the sidebar.
+    ///
+    /// Every caller is reacting to something that just changed the answer, so
+    /// this is fire-and-forget: the rows update a moment later rather than the
+    /// UI waiting on a subprocess.
+    pub(crate) fn refresh_cloud(self: &Rc<Self>) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            let accounts = run_off_thread(crate::fs::cloud::accounts).await;
+            this.sidebar.set_cloud(accounts);
+        });
+    }
+
     /// Adds a cloud account, signing in whichever way the provider needs.
     pub(crate) fn add_cloud_drive(self: &Rc<Self>) {
         let this = Rc::clone(self);
@@ -1140,7 +1153,7 @@ impl Window {
         match result {
             Ok(account) => {
                 self.toast(&format!("Added {}", account.display_name()));
-                self.sidebar.refresh_cloud();
+                self.refresh_cloud();
                 self.open_cloud(account);
             }
             Err(message) => {
@@ -1163,8 +1176,9 @@ impl Window {
             }
         };
         // The remote name is the last argument rclone was told to create, and
-        // it is needed afterwards to ask the provider who signed in.
+        // it is needed afterwards to check the sign-in landed.
         let remote = args.get(2).cloned().unwrap_or_default();
+        let label = details.name.clone();
         self.toast("A browser will open for you to sign in…");
 
         let result = run_off_thread(move || {
@@ -1184,17 +1198,22 @@ impl Window {
 
         match result {
             Ok(()) => {
-                let identity =
-                    run_off_thread({
-                        let remote = remote.clone();
-                        move || crate::fs::cloud::record_identity(&remote)
-                    })
-                    .await;
-                self.sidebar.refresh_cloud();
-                if identity.is_empty() {
-                    self.toast("Account added");
-                } else {
-                    self.toast(&format!("Added {identity}"));
+                // rclone exits 0 once the remote is written, which happens even
+                // when the browser half never finished. What matters is whether
+                // the account can actually be read.
+                let finished = run_off_thread({
+                    let (remote, label) = (remote.clone(), label.clone());
+                    move || crate::fs::cloud::finish_oauth(&remote, &label)
+                })
+                .await;
+                self.refresh_cloud();
+
+                match finished {
+                    Ok(identity) if identity.is_empty() => self.toast("Account added"),
+                    Ok(identity) => self.toast(&format!("Added {identity}")),
+                    Err(message) => {
+                        dialogs::show_error(&self.widget(), "Sign-in did not finish", &message);
+                    }
                 }
             }
             Err(message) => {
@@ -1226,7 +1245,7 @@ impl Window {
 
             match result {
                 Ok(()) => {
-                    this.sidebar.refresh_cloud();
+                    this.refresh_cloud();
                     this.open_path(account.mount_point.clone());
                 }
                 Err(message) => {
@@ -1251,7 +1270,7 @@ impl Window {
 
             match result {
                 Ok(()) => {
-                    this.sidebar.refresh_cloud();
+                    this.refresh_cloud();
                     this.transient_toast(&format!("Disconnected {}", account.display_name()));
                 }
                 Err(message) => {
@@ -1287,7 +1306,7 @@ impl Window {
             })
             .await;
 
-            this.sidebar.refresh_cloud();
+            this.refresh_cloud();
             match result {
                 Ok(()) => this.transient_toast(&format!("Removed {}", account.display_name())),
                 Err(message) => {

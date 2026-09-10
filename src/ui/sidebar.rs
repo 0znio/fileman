@@ -203,12 +203,15 @@ impl Sidebar {
         self.rebuild();
     }
 
-    /// Re-reads cloud accounts and their mount state.
+    /// Replaces the known cloud accounts.
     ///
-    /// This shells out to rclone, so it is called on the events that can change
-    /// the answer rather than on every rebuild.
-    pub fn refresh_cloud(self: &Rc<Self>) {
-        *self.cloud.borrow_mut() = crate::fs::cloud::accounts();
+    /// The list is passed in rather than read here: finding it runs rclone, and
+    /// a subprocess must never happen on the main loop — 60 ms of it is a
+    /// visible hitch, and a config on a stalled filesystem would freeze the
+    /// window outright. [`crate::ui::window::Window::refresh_cloud`] does the
+    /// work off-thread and hands the answer here.
+    pub fn set_cloud(self: &Rc<Self>, accounts: Vec<crate::fs::cloud::Account>) {
+        *self.cloud.borrow_mut() = accounts;
         self.rebuild();
     }
 

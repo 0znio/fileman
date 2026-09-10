@@ -216,8 +216,13 @@ pub const INSTALL_HINT: &str = "Cloud drives need rclone, which handles the sign
 fn rclone() -> Result<Command, String> {
     let path = rclone_path().ok_or_else(|| INSTALL_HINT.to_string())?;
     let mut command = Command::new(path);
-    // Never let rclone stop to ask a question on a terminal nobody is watching.
-    command.arg("--non-interactive");
+    // Nothing global is added here. `--non-interactive` reads like a sensible
+    // default for a program driven by a GUI, and it is not a global flag:
+    // rclone accepts it only on `config create`/`update`, and putting it before
+    // the subcommand makes every single command fail with "unknown command".
+    // That silently broke account listing and password storage alike, so the
+    // flag now appears exactly where it is valid and nowhere else.
+    command.stdin(std::process::Stdio::null());
     Ok(command)
 }
 
@@ -403,6 +408,13 @@ pub struct NewAccount {
     pub totp: String,
     /// WebDAV endpoint for providers that do not have a fixed one.
     pub url: String,
+    /// Optional OAuth application credentials.
+    ///
+    /// rclone ships a shared client ID for Google Drive that Google is
+    /// retiring during 2026, and shared IDs are rate-limited across every
+    /// rclone user in the meantime. Supplying your own removes both problems.
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 /// Creates an rclone remote for a password-based provider.
@@ -422,8 +434,16 @@ pub fn connect_with_password(details: &NewAccount) -> Result<Account, String> {
     }
 
     let obscured = obscure(&details.password)?;
-    let mut args: Vec<String> =
-        vec!["config".into(), "create".into(), remote.clone(), backend.into()];
+    let mut args: Vec<String> = vec![
+        "config".into(),
+        "create".into(),
+        remote.clone(),
+        backend.into(),
+        // Valid here and only here. Without it rclone falls back to its
+        // interactive questionnaire for anything it was not told, which from a
+        // GUI means a process waiting forever on a stdin nobody can type into.
+        "--non-interactive".into(),
+    ];
 
     match details.provider {
         Provider::ProtonDrive => {
@@ -463,6 +483,14 @@ pub fn connect_with_password(details: &NewAccount) -> Result<Account, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    // Under `--non-interactive` rclone reports a refusal *inside* a JSON object
+    // and still exits 0, so the exit status alone would call a rejected
+    // password a success. `verify` below would catch it either way, but only
+    // this carries rclone's own explanation of what was wrong.
+    if let Some(problem) = create_error(&output.stdout) {
+        let _ = forget(&remote);
+        return Err(problem);
+    }
 
     let identity = details.username.trim().to_string();
     save_identity(&remote, &identity);
@@ -481,6 +509,25 @@ pub fn connect_with_password(details: &NewAccount) -> Result<Account, String> {
         identity,
         mount_point: mount_root().join(&remote),
         mounted: false,
+    })
+}
+
+/// Reads the failure out of `rclone config create --non-interactive` output.
+///
+/// A pending `Option` means rclone wanted to ask another question it could not
+/// ask, which for our purposes is just as broken as an outright error.
+fn create_error(stdout: &[u8]) -> Option<String> {
+    let report: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    if let Some(error) = report.get("Error").and_then(|e| e.as_str())
+        && !error.trim().is_empty()
+    {
+        return Some(format!("rclone could not set that account up: {}", error.trim()));
+    }
+    let pending = report.get("Option").is_some_and(|o| !o.is_null());
+    pending.then(|| {
+        "That provider needs more information than this dialog asks for. \
+         Set it up with `rclone config` and it will appear here."
+            .to_string()
     })
 }
 
@@ -507,15 +554,30 @@ pub fn oauth_command(details: &NewAccount) -> Result<(String, Vec<String>), Stri
         // create is not a file manager.
         args.push("scope=drive".into());
     }
+    for (key, value) in [
+        ("client_id", details.client_id.trim()),
+        ("client_secret", details.client_secret.trim()),
+    ] {
+        if !value.is_empty() {
+            args.push(format!("{key}={value}"));
+        }
+    }
     Ok((path.to_string_lossy().into_owned(), args))
 }
 
-/// Asks the provider who we just signed in as, and remembers it.
+/// Settles what an account is called, and remembers it.
 ///
-/// Without this two Google Drives are both called "Google Drive" and the user
-/// has no way to tell which is which.
-pub fn record_identity(remote: &str) -> String {
-    let identity = fetch_identity(remote).unwrap_or_default();
+/// The provider is asked first, because an address it confirms beats anything
+/// typed by hand. Only some backends can answer: Dropbox and OneDrive report a
+/// user, and **Google Drive cannot** — a `drive`-scoped token carries no
+/// profile scope, so both `config userinfo` and the Drive API's `about.user`
+/// come back empty. There is no way to read the address of a Drive account
+/// rclone has signed into, so `fallback` — the name the user gave the account —
+/// is what keeps two of them apart. That is why the dialog insists on one.
+pub fn record_identity(remote: &str, fallback: &str) -> String {
+    let identity = fetch_identity(remote)
+        .filter(|found| !found.is_empty())
+        .unwrap_or_else(|| fallback.trim().to_string());
     if !identity.is_empty() {
         save_identity(remote, &identity);
     }
@@ -541,6 +603,39 @@ fn fetch_identity(remote: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Confirms a browser sign-in actually produced working credentials.
+///
+/// `rclone config create` exits 0 after writing the remote even when the OAuth
+/// round trip did not finish, which leaves a remote with no token behind and
+/// reports success. The account then sits in the sidebar and fails at the first
+/// click. Anything that cannot be listed is removed again and reported as the
+/// failure it was.
+pub fn finish_oauth(remote: &str, fallback: &str) -> Result<String, String> {
+    if !has_credentials(remote) {
+        let _ = forget(remote);
+        return Err("The sign-in did not complete — no access was granted.".into());
+    }
+    if let Err(e) = verify(remote) {
+        let _ = forget(remote);
+        return Err(e);
+    }
+    Ok(record_identity(remote, fallback))
+}
+
+/// Whether a remote holds an OAuth token at all.
+fn has_credentials(remote: &str) -> bool {
+    let Ok(mut command) = rclone() else { return false };
+    let Ok(output) = command.args(["config", "dump"]).output() else { return false };
+    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    config
+        .get(remote)
+        .and_then(|settings| settings.get("token"))
+        .and_then(|token| token.as_str())
+        .is_some_and(|token| !token.trim().is_empty())
 }
 
 /// A cheap round trip that fails loudly on bad credentials.
@@ -694,12 +789,83 @@ mod tests {
         assert_eq!(typed("dropbox"), Provider::Dropbox);
     }
 
+    /// rclone reports these failures with exit code 0, so the JSON is the only
+    /// thing that distinguishes a working account from a refused one.
+    #[test]
+    fn a_refusal_hidden_in_a_zero_exit_is_still_a_refusal() {
+        let clean = br#"{"State":"","Option":null,"Error":"","Result":""}"#;
+        assert_eq!(create_error(clean), None, "a complete setup is not an error");
+
+        let refused = br#"{"State":"","Option":null,"Error":"401 Unauthorized","Result":""}"#;
+        let message = create_error(refused).expect("an Error field must be reported");
+        assert!(message.contains("401 Unauthorized"), "{message}");
+
+        // A question rclone could not ask means the account is not set up.
+        let pending = br#"{"State":"x","Option":{"Name":"otp"},"Error":"","Result":""}"#;
+        assert!(create_error(pending).is_some(), "a pending question must be reported");
+
+        // Output that is not the JSON report tells us nothing either way.
+        assert_eq!(create_error(b"not json"), None);
+    }
+
     #[test]
     fn oauth_providers_are_not_offered_a_password_field() {
         assert!(Provider::GoogleDrive.uses_oauth());
         assert!(Provider::OneDrive.uses_oauth());
         assert!(!Provider::ProtonDrive.uses_oauth());
         assert!(!Provider::Icedrive.uses_oauth());
+    }
+
+    /// Exercises the real rclone binary, because the bug that made this feature
+    /// useless was invisible to every hermetic test: a flag that rclone rejects
+    /// made `config dump` fail, `accounts` return empty, and the sidebar show
+    /// nothing at all while reporting that sign-in had succeeded. Only actually
+    /// running the command catches that class of mistake.
+    ///
+    /// Skips where rclone is absent, so it is honest on a machine without it
+    /// rather than failing for the wrong reason.
+    #[test]
+    fn rclone_is_invoked_in_a_way_rclone_accepts() {
+        if !is_available() {
+            eprintln!("skipped: rclone is not installed");
+            return;
+        }
+
+        // The listing command must succeed. An empty config is a fine answer;
+        // a failed command is not, and is indistinguishable from it in the
+        // return type, so the process status is checked directly.
+        let output = rclone()
+            .expect("rclone was reported as available")
+            .args(["config", "dump"])
+            .output()
+            .expect("could not run rclone");
+        assert!(
+            output.status.success(),
+            "`rclone config dump` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .expect("rclone config dump did not return JSON");
+
+        // Storing a password has to work too; this was the second casualty of
+        // the same flag, surfacing as "could not save password".
+        let obscured = obscure("a-test-password").expect("rclone could not obscure a password");
+        assert!(!obscured.trim().is_empty(), "obscured password came back empty");
+        assert_ne!(obscured, "a-test-password", "the password was stored in clear");
+
+        // Whatever the user has configured, every account must be usable as a
+        // sidebar row: named, and at its own mount point.
+        let accounts = accounts();
+        let mut seen = std::collections::BTreeSet::new();
+        for account in &accounts {
+            assert!(!account.remote.trim().is_empty(), "an account has no remote name");
+            assert!(!account.display_name().trim().is_empty(), "{} has no label", account.remote);
+            assert!(
+                seen.insert(account.mount_point.clone()),
+                "{} shares a mount point with another account",
+                account.remote,
+            );
+        }
     }
 
     /// A path that is not a mount point must never be reported as one, or the

@@ -679,7 +679,7 @@ fn folder_button_content(path: &Path) -> gtk::Box {
 }
 
 fn describe(probe: &crate::fs::download::Probe) -> String {
-    match probe.size {
+    let transfer = match probe.size {
         Some(size) => format!(
             "{}{}",
             humansize::format_size(size, humansize::DECIMAL),
@@ -690,6 +690,15 @@ fn describe(probe: &crate::fs::download::Probe) -> String {
             }
         ),
         None => "Size unknown · single connection".to_string(),
+    };
+
+    // A share link usually points at a viewer page rather than the file, so the
+    // address that will actually be fetched is often not the one that was
+    // pasted. Showing it makes a wrong guess correctable instead of mysterious.
+    if probe.was_redirected() {
+        format!("{transfer}\nFetching from {}", probe.url)
+    } else {
+        transfer
     }
 }
 

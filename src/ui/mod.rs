@@ -1,5 +1,6 @@
 pub mod accent;
 pub mod actions;
+pub mod connect;
 pub mod dialogs;
 pub mod file_object;
 pub mod file_view;

@@ -33,7 +33,7 @@ libc = "0.2"
 urlencoding = "2.1"
 shell-words = "1.1"
 async-channel = "2.5"
-ureq = { version = "3.4.1", features = ["rustls"] }
+ureq = { version = "3.4.1", features = ["rustls", "cookies", "json"] }
 
 [profile.release]
 opt-level = 3

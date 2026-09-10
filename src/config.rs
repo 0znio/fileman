@@ -86,6 +86,11 @@ pub struct Config {
     /// Files above this size are never thumbnailed (bytes).
     pub thumbnail_max_bytes: u64,
     pub favourites: Vec<PathBuf>,
+    /// Network shares the user has saved, so they appear in the sidebar
+    /// whether or not they are mounted right now. Credentials are never kept
+    /// here: gvfs holds those in the login keyring.
+    #[serde(default)]
+    pub servers: Vec<crate::fs::remote::Server>,
     pub window_width: i32,
     pub window_height: i32,
     pub window_maximized: bool,
@@ -111,6 +116,7 @@ impl Default for Config {
             show_thumbnails: true,
             thumbnail_max_bytes: 32 * 1024 * 1024,
             favourites: Vec::new(),
+            servers: Vec::new(),
             window_width: 1200,
             window_height: 760,
             window_maximized: false,

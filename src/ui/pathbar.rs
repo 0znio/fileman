@@ -130,6 +130,51 @@ impl PathBar {
         });
         self.crumb_scroller.add_controller(click);
 
+        // Double-click anywhere on the strip — crumbs included — reveals the
+        // editable path.
+        //
+        // Clicking a gap already does this, but a long path leaves no gap to
+        // click, which made the only mouse route to the full path disappear
+        // exactly when the path was long enough to need it.
+        //
+        // The gesture runs in the capture phase so it sees the press before the
+        // crumb button underneath. It cannot suppress the *first* click, which
+        // has already navigated by the time a second arrives — so the location
+        // at the moment of the first press is remembered and restored here.
+        // Double-clicking a crumb therefore leaves you exactly where you were,
+        // looking at the full path, rather than one directory up.
+        let previous: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let reveal = gtk::GestureClick::new();
+        reveal.set_button(gdk::BUTTON_PRIMARY);
+        reveal.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        reveal.connect_pressed(move |gesture, n_press, _, _| {
+            let Some(this) = weak.upgrade() else { return };
+            if n_press == 1 {
+                *previous.borrow_mut() = Some(this.current.borrow().clone());
+                return;
+            }
+            if n_press != 2 {
+                return;
+            }
+            // Claiming stops the second press reaching the crumb button, so it
+            // cannot navigate again on top of the restore below.
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+
+            // Cloned out before navigating: the callback reaches back into
+            // `set_path`, which borrows `current` mutably.
+            let before = previous.borrow().clone();
+            let now = this.current.borrow().clone();
+            match before {
+                Some(before) if before != now => {
+                    this.edit_path(&before);
+                    this.navigate(before);
+                }
+                _ => this.start_editing(),
+            }
+        });
+        self.crumb_scroller.add_controller(reveal);
+
         // Middle-click pastes the primary selection as a path, matching the
         // convention of every other location bar on the desktop.
         let paste = gtk::GestureClick::new();
@@ -240,6 +285,12 @@ impl PathBar {
     /// Switches to the editable path, selected so typing replaces it.
     pub fn start_editing(self: &Rc<Self>) {
         let path = self.current.borrow().clone();
+        self.edit_path(&path);
+    }
+
+    /// The same, for a path that is not (or is no longer) the current one.
+    fn edit_path(self: &Rc<Self>, path: &Path) {
+        let path = path.to_path_buf();
         self.updating.set(true);
         self.entry.set_text(&path.to_string_lossy());
         self.updating.set(false);

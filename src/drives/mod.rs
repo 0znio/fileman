@@ -10,6 +10,7 @@
 //! error; [`classify_mount_error`] turns it into something the UI can offer a
 //! real fix for. See [`repair_and_mount`] and [`force_mount`].
 
+mod health;
 mod proxy;
 
 use std::{
@@ -84,6 +85,12 @@ pub struct Volume {
     pub fstype: String,
     pub size: u64,
     pub mount_point: Option<PathBuf>,
+    /// A mount point UDisks2 still reports that the kernel can no longer serve.
+    ///
+    /// Set when a drive was disconnected while something was using it: the
+    /// entry survives in the mount table with nothing behind it, so the volume
+    /// looks mounted and cannot be mounted again until it is cleared.
+    pub stale_mount: Option<PathBuf>,
     pub read_only: bool,
     pub category: VolumeCategory,
     /// Vendor + model of the physical drive, for the tooltip.
@@ -244,17 +251,33 @@ fn build_volume(
         return None;
     }
 
-    let mount_point = iface(ifaces, IFACE_FILESYSTEM)
+    let reported_mount = iface(ifaces, IFACE_FILESYSTEM)
         .and_then(|fsp| first_bytestring_list(fsp, "MountPoints"))
         .map(PathBuf::from);
+
+    // What UDisks2 reports and what the kernel can actually serve are two
+    // different things after an unclean disconnect, so the mount point is only
+    // believed once it answers. A dead one is kept separately: it is the thing
+    // standing between the user and a working drive, and it has to be cleared
+    // rather than ignored.
+    let (mount_point, stale_mount) = match &reported_mount {
+        None => (None, None),
+        Some(path) => match health::health(path) {
+            health::Health::Live => (reported_mount.clone(), None),
+            health::Health::Dead => (None, Some(path.clone())),
+            // UDisks2 says mounted, the kernel has no such mount. Nothing to
+            // clean up — it simply is not mounted.
+            health::Health::Absent => (None, None),
+        },
+    };
 
     // Hide the filesystem the running system booted from: navigating "/" is
     // what the Home shortcut and path bar are for, and offering to unmount it
     // would be actively hostile.
-    if mount_point.as_deref() == Some(Path::new("/")) || root_device == Some(device.as_path()) {
+    if reported_mount.as_deref() == Some(Path::new("/")) || root_device == Some(device.as_path()) {
         return None;
     }
-    if mount_point.as_deref().is_some_and(|m| m.starts_with("/boot")) {
+    if reported_mount.as_deref().is_some_and(|m| m.starts_with("/boot")) {
         return None;
     }
 
@@ -308,6 +331,7 @@ fn build_volume(
         fstype,
         size: get_u64(block, "Size"),
         mount_point,
+        stale_mount,
         read_only: get_bool(block, "ReadOnly"),
         category,
         drive_name,
@@ -424,14 +448,33 @@ fn filesystem_proxy(
 /// The `fstype` values to try, in order. An empty string means "let UDisks2
 /// choose", which is the in-kernel driver.
 ///
-/// `ntfs-3g` reads volumes Windows left dirty; the in-kernel `ntfs3` refuses
-/// them outright but is markedly faster on the ones it accepts. So the kernel
-/// driver leads unless this particular volume has already proved it needs FUSE.
+/// The FUSE driver reads volumes Windows left dirty; the in-kernel `ntfs3`
+/// refuses them outright but is markedly faster on the ones it accepts. So the
+/// kernel driver leads unless this particular volume has already proved it
+/// needs FUSE.
+///
+/// # It has to be spelled `ntfs`, not `ntfs-3g`
+///
+/// This is the opposite of what it looks like, and getting it wrong disabled
+/// the fallback completely. UDisks2 validates the requested type against its
+/// well-known list, `/proc/filesystems` and `/etc/filesystems`, and `ntfs-3g`
+/// is in none of them — the kernel registers `ntfs3`, and `ntfs-3g` is the name
+/// of a *helper binary*, not a filesystem. Asking for it fails before anything
+/// is attempted:
+///
+/// ```text
+/// OptionNotPermitted: Requested filesystem type `ntfs-3g' is neither
+/// well-known nor in /proc/filesystems nor in /etc/filesystems
+/// ```
+///
+/// `ntfs` is well-known to UDisks2, and the mount it performs runs
+/// `/sbin/mount.ntfs`, which on every distribution that ships ntfs-3g is a
+/// symlink to it. The volume comes back as `fuseblk` — FUSE, as intended.
 fn mount_order(is_ntfs: bool, prefer_fuse: bool) -> &'static [&'static str] {
     if is_ntfs && prefer_fuse {
-        &["ntfs-3g", ""]
+        &["ntfs", ""]
     } else {
-        &["", "ntfs-3g"]
+        &["", "ntfs"]
     }
 }
 
@@ -442,6 +485,13 @@ fn mount_order(is_ntfs: bool, prefer_fuse: bool) -> &'static [&'static str] {
 pub struct Mounted {
     pub path: PathBuf,
     pub used_fuse: bool,
+    /// True when an earlier driver refused the volume and a later one took it.
+    ///
+    /// The refusal is a failed UDisks2 job, and anything on the desktop that
+    /// watches those — udiskie, for one — announces it as an error even though
+    /// the mount went on to succeed. The UI uses this to say what happened, so
+    /// a notification the user did not ask for has an explanation next to it.
+    pub recovered: bool,
 }
 
 /// Mounts `volume`, trying the FUSE driver first when asked.
@@ -456,6 +506,13 @@ pub struct Mounted {
 /// `ntfs-3g` once goes straight there afterwards and the in-kernel driver stays
 /// the fast default for volumes that can use it.
 pub fn mount(volume: &Volume, prefer_fuse: bool) -> Result<Mounted, MountError> {
+    // A dead mount left by an unclean disconnect occupies the mount point and
+    // makes every mount attempt fail. Clearing it first is what turns "this
+    // drive will not mount any more" back into an ordinary mount.
+    if volume.stale_mount.is_some() {
+        clear_stale_mount(volume)?;
+    }
+
     let order = mount_order(volume.is_ntfs(), prefer_fuse);
 
     let mut first_error: Option<MountError> = None;
@@ -465,7 +522,13 @@ pub fn mount(volume: &Volume, prefer_fuse: bool) -> Result<Mounted, MountError> 
             if fstype.is_empty() { Vec::new() } else { vec![("fstype", *fstype)] };
 
         match mount_with_options(volume, &options) {
-            Ok(path) => return Ok(Mounted { path, used_fuse: !fstype.is_empty() }),
+            Ok(path) => {
+                return Ok(Mounted {
+                    path,
+                    used_fuse: !fstype.is_empty(),
+                    recovered: index > 0,
+                });
+            }
             Err(error) => {
                 // Neither of these is a driver problem, and retrying with a
                 // different one would only produce a second identical failure.
@@ -491,12 +554,59 @@ pub fn mount(volume: &Volume, prefer_fuse: bool) -> Result<Mounted, MountError> 
     Err(first_error.unwrap_or_else(|| MountError::Other("Could not mount the volume".into())))
 }
 
+/// Releases a mount point the kernel is still holding but cannot serve.
+///
+/// Forced, because a polite unmount is refused while a process still holds a
+/// file on the vanished device — and that process is precisely why the mount
+/// went stale. Nothing can be lost by forcing: the device is already gone, so
+/// there are no writes left to flush.
+///
+/// Clearing a mount the user did not make needs admin rights, which is the
+/// normal case here: `~/load-ssd.sh` and anything else using `sudo mount`
+/// creates a root-owned mount that this session may not touch unaided. polkit
+/// prompts, and a refusal is reported as one.
+fn clear_stale_mount(volume: &Volume) -> Result<(), MountError> {
+    let Some(path) = &volume.stale_mount else { return Ok(()) };
+
+    let conn = connection().map_err(MountError::Other)?;
+    let proxy = filesystem_proxy(&conn, &volume.object_path).map_err(MountError::Other)?;
+
+    let mut opts: HashMap<&str, Value> = HashMap::new();
+    opts.insert("force", Value::from(true));
+    opts.insert("auth.no_user_interaction", Value::from(false));
+
+    match proxy.unmount(opts) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let raw = err.to_string();
+            // Already gone by the time we asked is exactly what we wanted.
+            if raw.to_lowercase().contains("not mounted") {
+                return Ok(());
+            }
+            match classify_mount_error(&raw, volume) {
+                MountError::NotAuthorized(_) => Err(MountError::NotAuthorized(format!(
+                    "{} is left over from a disconnect and has to be cleared before the \
+                     drive can be mounted again. That needs administrator approval, because \
+                     the mount was not made by this session.",
+                    path.display()
+                ))),
+                other => Err(other),
+            }
+        }
+    }
+}
+
 /// Mounts read-only — the safe answer when Windows is hibernated.
 ///
 /// Forced through `ntfs-3g` for the same reason as [`mount`]: `ntfs3` declines
 /// a dirty volume even for reading.
 pub fn mount_read_only(volume: &Volume) -> Result<PathBuf, MountError> {
+    if volume.stale_mount.is_some() {
+        clear_stale_mount(volume)?;
+    }
     if volume.is_ntfs() {
+        // `ntfs`, not `ntfs-3g` — see [`mount_order`] for why the obvious
+        // spelling is the one UDisks2 refuses.
         let via_ntfs3g = mount_with_options(volume, &[("fstype", "ntfs"), ("options", "ro")]);
         if via_ntfs3g.is_ok() {
             return via_ntfs3g;
@@ -677,6 +787,17 @@ fn classify_mount_error(raw: &str, volume: &Volume) -> MountError {
         });
     }
 
+    // UDisks2 refusing the *request* is our mistake, not a dirty volume, and
+    // must not be dressed up as one: offering to repair a filesystem when the
+    // real problem is an unsupported option sends the user chasing a fault that
+    // does not exist.
+    if lower.contains("optionnotpermitted") || lower.contains("neither well-known") {
+        return MountError::Other(format!(
+            "UDisks2 refused the mount options Fileman asked for. This is a bug in \
+             Fileman, not a problem with the drive.\n\n{raw}"
+        ));
+    }
+
     if volume.is_ntfs() || lower.contains("ntfs") {
         // Hibernation needs a stronger warning, because clearing it discards a
         // saved Windows session rather than just a dirty bit.
@@ -707,6 +828,11 @@ pub fn unmount(volume: &Volume) -> Result<(), String> {
 pub fn eject(volume: &Volume) -> Result<(), String> {
     if volume.is_mounted() {
         unmount(volume)?;
+    } else if volume.stale_mount.is_some() {
+        // The drive is not usable but the kernel still holds it, so powering
+        // down without clearing that would leave the entry behind for the next
+        // time it is plugged in — which is how the problem accumulates.
+        clear_stale_mount(volume).map_err(|e| e.message())?;
     }
     let Some(drive_path) = &volume.drive_path else {
         return Ok(());
@@ -956,6 +1082,58 @@ fn start_watch_thread() -> Result<(), String> {
 
 
 #[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    fn ntfs_volume() -> Volume {
+        Volume {
+            object_path: "/org/freedesktop/UDisks2/block_devices/sda1".into(),
+            drive_path: None,
+            device: PathBuf::from("/dev/sda1"),
+            label: "SSD-Store".into(),
+            uuid: "1234".into(),
+            fstype: "ntfs".into(),
+            size: 0,
+            mount_point: None,
+            stale_mount: None,
+            read_only: false,
+            category: VolumeCategory::Removable,
+            drive_name: String::new(),
+            ejectable: true,
+            can_power_off: true,
+            is_encrypted: false,
+        }
+    }
+
+    /// The generic kernel refusal really is a dirty volume, and every option
+    /// the recovery dialog offers applies to it.
+    #[test]
+    fn a_kernel_refusal_on_ntfs_is_treated_as_a_dirty_volume() {
+        let raw = "Error mounting /dev/sda1: wrong fs type, bad option, bad superblock \
+                   on /dev/sda1, missing codepage or helper program, or other error";
+        assert!(matches!(
+            classify_mount_error(raw, &ntfs_volume()),
+            MountError::NtfsUnclean { hibernated: false, .. }
+        ));
+    }
+
+    /// A rejected *option* is not a dirty volume, and must not open a repair
+    /// dialog that cannot possibly help.
+    #[test]
+    fn a_rejected_option_is_not_mistaken_for_a_dirty_volume() {
+        let raw = "GDBus.Error:org.freedesktop.UDisks2.Error.OptionNotPermitted: Requested \
+                   filesystem type `ntfs-3g' is neither well-known nor in /proc/filesystems \
+                   nor in /etc/filesystems";
+        match classify_mount_error(raw, &ntfs_volume()) {
+            MountError::Other(message) => {
+                assert!(message.contains("bug in Fileman"), "{message}");
+            }
+            other => panic!("expected a plain error, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod mount_order_tests {
     use super::mount_order;
 
@@ -964,10 +1142,10 @@ mod mount_order_tests {
     /// components report as an error even when the retry succeeds.
     #[test]
     fn a_remembered_volume_tries_the_fuse_driver_first() {
-        assert_eq!(mount_order(true, true), ["ntfs-3g", ""], "remembered NTFS goes to FUSE first");
-        assert_eq!(mount_order(true, false), ["", "ntfs-3g"], "unknown NTFS tries the kernel first");
-        assert_eq!(mount_order(false, true), ["", "ntfs-3g"], "non-NTFS never prefers FUSE");
-        assert_eq!(mount_order(false, false), ["", "ntfs-3g"]);
+        assert_eq!(mount_order(true, true), ["ntfs", ""], "remembered NTFS goes to FUSE first");
+        assert_eq!(mount_order(true, false), ["", "ntfs"], "unknown NTFS tries the kernel first");
+        assert_eq!(mount_order(false, true), ["", "ntfs"], "non-NTFS never prefers FUSE");
+        assert_eq!(mount_order(false, false), ["", "ntfs"]);
     }
 
     /// Both drivers are always reachable, whichever way round they are tried —
@@ -979,7 +1157,25 @@ mod mount_order_tests {
                 let order = mount_order(is_ntfs, prefer);
                 assert_eq!(order.len(), 2);
                 assert!(order.contains(&""), "the kernel driver must stay reachable");
-                assert!(order.contains(&"ntfs-3g"), "the FUSE driver must stay reachable");
+                assert!(order.contains(&"ntfs"), "the FUSE driver must stay reachable");
+            }
+        }
+    }
+
+    /// Pins the spelling, because the wrong one is the plausible-looking one.
+    ///
+    /// Naming the helper binary rather than the filesystem makes UDisks2 reject
+    /// the request outright with `OptionNotPermitted`, which meant every dirty
+    /// NTFS volume failed both attempts and had to be mounted from a terminal.
+    /// The mistake is invisible without a real drive, so it is fixed here.
+    #[test]
+    fn the_fallback_names_a_filesystem_udisks_will_accept() {
+        for is_ntfs in [true, false] {
+            for prefer in [true, false] {
+                assert!(
+                    !mount_order(is_ntfs, prefer).contains(&"ntfs-3g"),
+                    "`ntfs-3g` is a mount helper, not a filesystem UDisks2 accepts",
+                );
             }
         }
     }

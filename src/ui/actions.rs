@@ -1341,7 +1341,8 @@ impl Window {
             match result {
                 Ok(mounted) => {
                     this.remember_mount_driver(&volume, mounted.used_fuse);
-                    this.after_mount(&volume, mounted.path);
+                    let recovered = mounted.recovered;
+                    this.after_mount_reporting(&volume, mounted.path, recovered);
                 }
                 Err(MountError::AlreadyMounted(path)) => this.after_mount(&volume, path),
                 Err(MountError::NtfsUnclean { message, hibernated }) => {
@@ -1420,7 +1421,8 @@ impl Window {
             match result {
                 Ok(mounted) => {
                     self.remember_mount_driver(&volume, mounted.used_fuse);
-                    self.after_mount(&volume, mounted.path);
+                    let recovered = mounted.recovered;
+                    self.after_mount_reporting(&volume, mounted.path, recovered);
                     return;
                 }
                 Err(MountError::WrongPassphrase) => {
@@ -1512,8 +1514,29 @@ impl Window {
     }
 
     fn after_mount(self: &Rc<Self>, volume: &Volume, path: PathBuf) {
+        self.after_mount_reporting(volume, path, false);
+    }
+
+    /// Navigates into a freshly mounted volume and says how it went.
+    ///
+    /// `recovered` means the first driver refused the volume and a second one
+    /// took it. That refusal is a failed UDisks2 job, which udiskie and friends
+    /// announce as a system error card — so the mount appears to fail and then
+    /// succeed, with nothing explaining the contradiction. Saying it plainly
+    /// here is the only way to connect the two, since the notification comes
+    /// from another program entirely and cannot be suppressed from inside this
+    /// one.
+    fn after_mount_reporting(self: &Rc<Self>, volume: &Volume, path: PathBuf, recovered: bool) {
         self.refresh_drives();
-        self.toast(&format!("Mounted “{}”", volume.label));
+        if recovered {
+            self.toast(&format!(
+                "Mounted “{}” with ntfs-3g — Windows left it unclean. \
+                 Any mount error the system just reported can be ignored.",
+                volume.label
+            ));
+        } else {
+            self.toast(&format!("Mounted “{}”", volume.label));
+        }
         self.navigate_to(Location::Directory(path), true);
     }
 

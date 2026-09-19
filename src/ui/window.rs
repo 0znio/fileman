@@ -67,6 +67,17 @@ pub(crate) struct Tab {
     pub(crate) scan_generation: Cell<u64>,
     pub(crate) scan_cancellable: RefCell<gio::Cancellable>,
     pub(crate) dir_monitor: RefCell<Option<gio::FileMonitor>>,
+    /// Pending coalesced refresh. Per tab, because a burst of changes in a
+    /// background tab's folder must neither refresh the tab in front nor be
+    /// cancelled by activity there.
+    pub(crate) refresh_timer: RefCell<Option<glib::SourceId>>,
+    /// Bumped per refresh, so a slow rescan finishing after a newer one cannot
+    /// put an older listing back on screen.
+    pub(crate) refresh_generation: Cell<u64>,
+    /// True while the view holds search results rather than the folder's own
+    /// listing, so there is something to undo when the search changes or ends.
+    /// Per tab: switching tabs mid-search must not strand one tab's results.
+    pub(crate) showing_results: Cell<bool>,
 }
 
 impl Tab {
@@ -79,6 +90,9 @@ impl Tab {
             scan_generation: Cell::new(0),
             scan_cancellable: RefCell::new(gio::Cancellable::new()),
             dir_monitor: RefCell::new(None),
+            refresh_timer: RefCell::new(None),
+            refresh_generation: Cell::new(0),
+            showing_results: Cell::new(false),
         })
     }
 
@@ -112,6 +126,8 @@ pub struct Window {
 
     pub(crate) search_bar: gtk::SearchBar,
     pub(crate) search_entry: gtk::SearchEntry,
+    /// Switches the search from names to file contents.
+    pub(crate) search_contents: gtk::ToggleButton,
     pub(crate) status_label: gtk::Label,
     /// The "48px" readout in the icon-size popover, updated whenever the size
     /// changes so the popover cannot go on reporting a stale value while its
@@ -131,7 +147,6 @@ pub struct Window {
     pub(crate) clipboard: RefCell<Option<Clip>>,
 
     /// Debounce timer for filesystem-change-triggered reloads.
-    pub(crate) reload_timer: RefCell<Option<glib::SourceId>>,
     pub(crate) save_timer: RefCell<Option<glib::SourceId>>,
 
     /// The running recursive search, if any. Dropping it cancels the walk.
@@ -150,6 +165,9 @@ pub struct Window {
     /// widget tree *before* GTK dispatches the item you clicked, so the
     /// `win.` action lookup finds nothing and the click silently does nothing.
     pub(crate) context_menu: Rc<crate::ui::menu::ContextMenu>,
+    /// Built on first use and then kept, so reopening it is instant.
+    pub(crate) preview: RefCell<Option<Rc<crate::ui::preview::Preview>>>,
+    pub(crate) usage: RefCell<Option<Rc<crate::ui::usage::UsageWindow>>>,
 }
 
 /// The banner is shared between unrelated states, so its button needs to know
@@ -248,8 +266,18 @@ impl Window {
             .placeholder_text("Filter by name…")
             .hexpand(true)
             .build();
+        let search_contents = gtk::ToggleButton::builder()
+            .label("Contents")
+            .tooltip_text("Search inside files instead of their names")
+            .build();
+        let search_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        search_row.append(&search_entry);
+        search_row.append(&search_contents);
         let search_bar = gtk::SearchBar::builder()
-            .child(&search_entry)
+            .child(&search_row)
             .key_capture_widget(&window)
             .build();
         search_bar
@@ -342,6 +370,7 @@ impl Window {
             split,
             search_bar,
             search_entry,
+            search_contents,
             status_label,
             zoom_label,
             transient_toast_handle: Rc::new(RefCell::new(None)),
@@ -352,13 +381,14 @@ impl Window {
             up_button,
             volumes: RefCell::new(Vec::new()),
             clipboard: RefCell::new(None),
-            reload_timer: RefCell::new(None),
             save_timer: RefCell::new(None),
             search_job: RefCell::new(None),
             search_generation: Cell::new(0),
             banner_action: RefCell::new(BannerAction::None),
             navigating: Cell::new(false),
             context_menu,
+            preview: RefCell::new(None),
+            usage: RefCell::new(None),
         });
 
         this.apply_theme();
@@ -551,14 +581,29 @@ impl Window {
             this.update_search(entry.text().as_str());
         });
 
+        let weak = Rc::downgrade(self);
+        self.search_contents.connect_toggled(move |toggle| {
+            let Some(this) = weak.upgrade() else { return };
+            this.search_entry.set_placeholder_text(Some(if toggle.is_active() {
+                "Search inside files…"
+            } else {
+                "Filter by name…"
+            }));
+            let text = this.search_entry.text().to_string();
+            this.update_search(&text);
+            this.search_entry.grab_focus();
+        });
+
         // Leaving search should return focus to the files, not strand it in a
         // hidden entry.
         let weak = Rc::downgrade(self);
         self.search_bar.connect_notify_local(Some("search-mode-enabled"), move |bar, _| {
             let Some(this) = weak.upgrade() else { return };
             if !bar.is_search_mode() {
+                this.stop_search();
                 this.search_entry.set_text("");
                 this.view().set_search("");
+                this.restore_listing();
                 this.view().focus_first();
                 this.update_status();
             }
@@ -816,6 +861,9 @@ impl Window {
 
         self.view().clear();
         self.tab().entries.borrow_mut().clear();
+        // The view is being refilled from scratch, so no search results are
+        // left in it to restore.
+        tab.showing_results.set(false);
         // A walk rooted at the folder we are leaving is no longer wanted.
         self.search_generation.set(self.search_generation.get() + 1);
         *self.search_job.borrow_mut() = None;
@@ -982,54 +1030,125 @@ impl Window {
             return;
         };
 
+        // The monitor belongs to the tab it was installed for. Looking the tab
+        // up when an event arrived meant a change in a background tab's folder
+        // reloaded whichever tab happened to be in front.
         let weak = Rc::downgrade(self);
+        let tab = Rc::downgrade(&self.tab());
         monitor.connect_changed(move |_, _, _, _| {
-            let Some(this) = weak.upgrade() else { return };
-            this.schedule_reload();
+            let (Some(this), Some(tab)) = (weak.upgrade(), tab.upgrade()) else { return };
+            this.schedule_refresh(&tab);
         });
 
         *self.tab().dir_monitor.borrow_mut() = Some(monitor);
     }
 
-    /// Coalesces a burst of filesystem events into one reload.
+    /// Coalesces a burst of filesystem events into one refresh.
     ///
     /// Extracting an archive can emit thousands of events; without this the
-    /// window would re-scan for every file created.
-    fn schedule_reload(self: &Rc<Self>) {
-        if let Some(existing) = self.reload_timer.borrow_mut().take() {
+    /// tab would re-scan for every file created.
+    fn schedule_refresh(self: &Rc<Self>, tab: &Rc<Tab>) {
+        if let Some(existing) = tab.refresh_timer.borrow_mut().take() {
             existing.remove();
         }
         let weak = Rc::downgrade(self);
-        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
-            let Some(this) = weak.upgrade() else { return };
-            *this.reload_timer.borrow_mut() = None;
-            this.reload();
+        let weak_tab = Rc::downgrade(tab);
+        let id = glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+            let (Some(this), Some(tab)) = (weak.upgrade(), weak_tab.upgrade()) else { return };
+            *tab.refresh_timer.borrow_mut() = None;
+            this.refresh_tab(&tab, Vec::new());
         });
-        *self.reload_timer.borrow_mut() = Some(id);
+        *tab.refresh_timer.borrow_mut() = Some(id);
     }
 
+    /// Shows the current state of the open folder.
+    ///
+    /// Folders are updated in place; see [`Self::refresh_tab`]. Trash and
+    /// Recent are rebuilt, being small lists assembled from other sources.
     pub(crate) fn reload(self: &Rc<Self>) {
-        // A reload triggered after a delete may find the directory itself gone.
-        if let Some(current) = self.current_dir()
-            && !current.is_dir()
-        {
-            self.recover_from_missing_directory(&current);
+        let tab = self.tab();
+        let location = tab.location.borrow().clone();
+        match location {
+            Location::Directory(_) => self.refresh_tab(&tab, Vec::new()),
+            other => self.navigate_to(other, false),
+        }
+    }
+
+    /// Reloads, then selects `paths` once they are actually on screen.
+    ///
+    /// Used after creating, renaming or pasting, so the new item is selected
+    /// and ready. This used to reload and then select on a 200 ms timer, which
+    /// was a guess about how long the scan would take: in a large folder the
+    /// guess lost, and the file you had just made was not selected.
+    pub(crate) fn reload_and_select(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        let tab = self.tab();
+        let location = tab.location.borrow().clone();
+        match location {
+            Location::Directory(_) => self.refresh_tab(&tab, paths),
+            other => self.navigate_to(other, false),
+        }
+    }
+
+    /// Rescans a tab's folder and applies only the differences.
+    ///
+    /// Deliberately not a navigation. Navigating clears the view, which is the
+    /// flicker, and it also resets the search: a download finishing in the
+    /// background used to wipe out a search the user was in the middle of
+    /// typing, and close the search bar under them.
+    fn refresh_tab(self: &Rc<Self>, tab: &Rc<Tab>, select: Vec<PathBuf>) {
+        let Location::Directory(path) = tab.location.borrow().clone() else { return };
+
+        // The folder itself may be what went away — deleted, or on a drive
+        // that was pulled.
+        if !path.is_dir() {
+            if Rc::ptr_eq(tab, &self.tab()) {
+                self.recover_from_missing_directory(&path);
+            }
             return;
         }
 
-        let selected = self.view().selected_paths();
-        let location = self.tab().location.borrow().clone();
-        self.navigate_to(location, false);
+        let scan_generation = tab.scan_generation.get();
+        let refresh = tab.refresh_generation.get() + 1;
+        tab.refresh_generation.set(refresh);
+        let cancellable = tab.scan_cancellable.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let tab = Rc::clone(tab);
 
-        // Restore the selection once the new listing has had a chance to load.
-        if !selected.is_empty() {
-            let weak = Rc::downgrade(self);
-            glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
-                if let Some(this) = weak.upgrade() {
-                    this.view().select_paths(&selected);
-                }
-            });
-        }
+        glib::spawn_future_local(async move {
+            let mut fresh = Vec::new();
+            let result = scan::scan_dir(&path, &cancellable, |batch| fresh.extend(batch)).await;
+
+            let Some(this) = weak.upgrade() else { return };
+            // Navigated elsewhere, or a newer refresh overtook this one: its
+            // listing describes something no longer on screen.
+            if tab.scan_generation.get() != scan_generation
+                || tab.refresh_generation.get() != refresh
+            {
+                return;
+            }
+            // A failed rescan says nothing about the files; keep what is shown
+            // rather than emptying the view.
+            if result.is_err() {
+                return;
+            }
+
+            *tab.entries.borrow_mut() = fresh.clone();
+            // Search results are on screen instead of the listing: keep the
+            // fresh listing for when the search ends, but leave the results.
+            // Applying it here would delete every match the moment anything in
+            // the folder changed.
+            if tab.showing_results.get() {
+                return;
+            }
+            tab.view.apply_listing(fresh);
+            // Only now are the new items in the model, so this cannot miss.
+            if !select.is_empty() {
+                tab.view.select_paths(&select);
+            }
+            if Rc::ptr_eq(&tab, &this.tab()) {
+                this.update_status();
+            }
+        });
     }
 
     pub(crate) fn go_back(self: &Rc<Self>) {
@@ -1175,11 +1294,24 @@ impl Window {
     /// The local filter is instant and covers the common case; the recursive
     /// walk is what makes searching from Home actually find anything.
     pub(crate) fn update_search(self: &Rc<Self>, query: &str) {
-        self.view().set_search(query);
-        self.update_status();
         self.stop_search();
-
+        let contents = self.search_contents.is_active();
         let query = query.trim().to_string();
+
+        // Every new query starts from the folder's own listing. The results of
+        // the previous query used to stay in the view, so each keystroke added
+        // its walk's matches on top of the last one's — typing a word listed
+        // the same deep file once per letter, and closing the search left all
+        // of them mixed into the folder.
+        self.restore_listing();
+
+        // By name, the folder's own files are filtered in place and the walk
+        // adds matches from below. By contents a name filter would hide every
+        // hit whose name does not happen to contain the query too, so the
+        // view is emptied and shows only what the walk finds.
+        self.view().set_search(if contents { "" } else { &query });
+        self.update_status();
+
         // One or two characters under a home directory matches thousands of
         // files and helps nobody; wait until the query means something.
         if query.chars().count() < 2 || self.in_trash() {
@@ -1188,23 +1320,33 @@ impl Window {
         }
         let Some(root) = self.current_dir() else { return };
 
+        if contents {
+            self.view().apply_listing(Vec::new());
+        }
+        self.tab().showing_results.set(true);
+
         let generation = self.search_generation.get() + 1;
         self.search_generation.set(generation);
 
         let skip_hidden = !self.config.borrow().show_hidden;
-        let handle = crate::fs::search::start(root.clone(), query.clone(), skip_hidden);
+        let handle = if contents {
+            crate::fs::search::start_contents(root.clone(), query.clone(), skip_hidden)
+        } else {
+            crate::fs::search::start(root.clone(), query.clone(), skip_hidden)
+        };
         let results = handle.results.clone();
         *self.search_job.borrow_mut() = Some(handle);
 
-        self.set_banner(
-            BannerAction::StopSearch,
-            &format!("Searching for “{query}” in {}…", display_title(&root)),
-            Some("Stop"),
-        );
+        let place = display_title(&root);
+        let banner = if contents {
+            format!("Searching files containing “{query}” in {place}…")
+        } else {
+            format!("Searching for “{query}” in {place}…")
+        };
+        self.set_banner(BannerAction::StopSearch, &banner, Some("Stop"));
 
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let mut found = 0usize;
             while let Ok(event) = results.recv().await {
                 let Some(this) = weak.upgrade() else { return };
                 if this.search_generation.get() != generation {
@@ -1212,24 +1354,37 @@ impl Window {
                 }
                 match event {
                     crate::fs::search::SearchEvent::Matches(batch) => {
-                        found += batch.len();
                         this.view().append_batch(batch);
                         this.update_status();
                     }
                     crate::fs::search::SearchEvent::Finished { total, truncated } => {
+                        let place = if contents { "in files here" } else { "below this folder" };
                         let message = match (total, truncated) {
+                            (0, _) if contents => format!("No file here contains “{query}”"),
                             (0, _) => format!("No matches for “{query}” below this folder"),
                             (n, true) => format!("Showing the first {n} matches — narrow the search to see fewer"),
-                            (n, false) => format!("{n} match{} below this folder", if n == 1 { "" } else { "es" }),
+                            (n, false) => format!("{n} match{} {place}", if n == 1 { "" } else { "es" }),
                         };
                         this.set_banner(BannerAction::None, &message, None);
                         this.update_status();
                         return;
                     }
                 }
-                let _ = found;
             }
         });
+    }
+
+    /// Puts the folder's own listing back in the view after a search.
+    ///
+    /// A diff rather than a reload, so the folder's files — which were never
+    /// removed during a name search — keep their widgets and thumbnails.
+    pub(crate) fn restore_listing(self: &Rc<Self>) {
+        let tab = self.tab();
+        if !tab.showing_results.replace(false) {
+            return;
+        }
+        let entries = tab.entries.borrow().clone();
+        tab.view.apply_listing(entries);
     }
 
     /// Cancels any running recursive search.
@@ -1607,6 +1762,7 @@ fn build_main_menu() -> gio::Menu {
     files.append(Some("New Folder"), Some("win.new-folder"));
     files.append(Some("New File"), Some("win.new-file"));
     files.append(Some("Open Terminal Here"), Some("win.open-terminal"));
+    files.append(Some("Disk Usage"), Some("win.disk-usage"));
     menu.append_section(None, &files);
 
     let view = gio::Menu::new();

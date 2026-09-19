@@ -1,4 +1,6 @@
-//! Image thumbnails for the icon view.
+//! Thumbnails for the icon view: images decoded in-process, and video, PDF
+//! and office documents through external thumbnailers
+//! ([`super::thumbnailers`]).
 //!
 //! Three things keep this off the critical path:
 //!
@@ -46,6 +48,16 @@ thread_local! {
     /// flight.
     static IN_FLIGHT: RefCell<HashMap<CacheKey, Vec<async_channel::Sender<Option<gdk::Texture>>>>> =
         RefCell::new(HashMap::new());
+
+    /// Files that could not be thumbnailed this session.
+    ///
+    /// Rows are rebound constantly as you scroll, and each rebind would
+    /// otherwise launch `ffmpeg` on the same broken video again. Kept in
+    /// memory rather than written to the shared `fail/` directory, because a
+    /// marker there outlives a fix — a thumbnailer installed tomorrow should get
+    /// its chance.
+    static FAILED: RefCell<std::collections::HashSet<CacheKey>> =
+        RefCell::new(std::collections::HashSet::new());
 
     /// Subdirectories of `thumbnails/fail`, listed once.
     ///
@@ -97,18 +109,27 @@ impl ThumbCache {
     }
 }
 
-/// Content types worth thumbnailing.
-///
-/// Deliberately limited to still images: video and document thumbnails need
-/// out-of-process thumbnailers, and spawning those per row is exactly the kind
-/// of thing that makes a file manager slow.
-pub fn can_thumbnail(content_type: &str) -> bool {
+/// Images gdk-pixbuf decodes in-process, which is the fast path.
+fn decodes_natively(content_type: &str) -> bool {
     if !content_type.starts_with("image/") {
         return false;
     }
     // SVG is rendered by librsvg through the same loader when it's installed;
     // these are the formats gdk-pixbuf handles natively everywhere.
     !matches!(content_type, "image/x-xcf" | "image/vnd.adobe.photoshop")
+}
+
+/// Whether a file of this type and size should get a thumbnail at all.
+///
+/// The size cap exists because decoding a photo costs time in proportion to
+/// its size, so it applies to images only. It would be wrong for anything
+/// else: a video thumbnail seeks to one frame, and a 4 GB film costs the same
+/// as a 40 MB clip. Applied across the board it hid every video there is.
+pub fn worth_thumbnailing(content_type: &str, size: u64, max_image_bytes: u64) -> bool {
+    if content_type.starts_with("image/") && size > max_image_bytes {
+        return false;
+    }
+    decodes_natively(content_type) || super::thumbnailers::method_for(content_type).is_some()
 }
 
 pub fn cached(path: &Path, mtime: i64, size: i32) -> Option<gdk::Texture> {
@@ -123,6 +144,7 @@ pub fn cached(path: &Path, mtime: i64, size: i32) -> Option<gdk::Texture> {
 /// worth surfacing as an error.
 pub async fn load(
     path: PathBuf,
+    content_type: &str,
     mtime: i64,
     size: i32,
     still_wanted: impl Fn() -> bool,
@@ -138,7 +160,7 @@ pub async fn load(
         return waiter.recv().await.ok().flatten();
     }
 
-    let texture = produce(&path, mtime, size, &still_wanted).await;
+    let texture = produce(&path, content_type, mtime, size, &still_wanted).await;
 
     if let Some(texture) = &texture {
         CACHE.with(|c| c.borrow_mut().insert(key.clone(), texture.clone()));
@@ -185,6 +207,7 @@ fn finish_in_flight(key: &CacheKey, texture: Option<gdk::Texture>) {
 /// Does the actual work: shared cache first, then a rate-limited decode.
 async fn produce(
     path: &Path,
+    content_type: &str,
     mtime: i64,
     size: i32,
     still_wanted: &impl Fn() -> bool,
@@ -194,7 +217,9 @@ async fn produce(
 
     // A previous attempt by any thumbnailer failed on this file; retrying would
     // burn the same time to reach the same conclusion.
-    if has_failure_marker(&digest) {
+    if has_failure_marker(&digest)
+        || FAILED.with(|f| f.borrow().contains(&(path.to_path_buf(), mtime, size)))
+    {
         return None;
     }
 
@@ -220,10 +245,24 @@ async fn produce(
 
     crate::trace::THUMB_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let target = fdo_target_size(size);
-    let result = decode_on_worker(path.to_path_buf(), Some(target)).await;
+    // In-process first where it applies; an external thumbnailer second, both
+    // for types gdk-pixbuf never handles and for images whose loader is
+    // missing (HEIF and AVIF, commonly), where the decode above just fails.
+    let mut result = None;
+    if decodes_natively(content_type) {
+        result = decode_on_worker(path.to_path_buf(), Some(target)).await;
+    }
+    if result.is_none()
+        && let Some(method) = super::thumbnailers::method_for(content_type)
+    {
+        result = render_on_worker(method, path.to_path_buf(), target).await;
+    }
     let _ = permit_tx.try_send(());
 
-    let raw = result?;
+    let Some(raw) = result else {
+        FAILED.with(|f| f.borrow_mut().insert((path.to_path_buf(), mtime, size)));
+        return None;
+    };
     // Hand the result to the rest of the desktop, not just this process.
     store_in_shared_cache(&raw, &digest, &uri, mtime, size);
     raw.into_texture()
@@ -290,11 +329,76 @@ async fn decode_on_worker(path: PathBuf, target: Option<i32>) -> Option<RawThumb
                 Some(size) => gdk_pixbuf::Pixbuf::from_file_at_scale(&path, size, size, true),
                 None => gdk_pixbuf::Pixbuf::from_file(&path),
             };
-            let raw = decoded.ok().as_ref().map(RawThumb::from_pixbuf);
+            let raw = decoded.ok().map(upright).as_ref().map(RawThumb::from_pixbuf);
             let _ = tx.send_blocking(raw);
         })
         .ok()?;
 
+    rx.recv().await.ok().flatten()
+}
+
+/// Turns a photo the way its camera says it was held.
+///
+/// Phones store portrait shots as landscape pixels plus an EXIF orientation
+/// tag. gdk-pixbuf reports the tag but does not act on it, so without this
+/// every portrait photo appears lying on its side.
+fn upright(pixbuf: gdk_pixbuf::Pixbuf) -> gdk_pixbuf::Pixbuf {
+    pixbuf.apply_embedded_orientation().unwrap_or(pixbuf)
+}
+
+/// A large rendering for the preview window.
+///
+/// Never cached: it is big, and wanted once. Never upscaled either — a 64 px
+/// icon blown up to fill the window is blurrier and larger than the icon
+/// itself, so an image already within `max` is decoded as it is.
+pub async fn render_large(path: PathBuf, content_type: &str, max: i32) -> Option<gdk::Texture> {
+    let mut raw = None;
+    if decodes_natively(content_type) {
+        let (tx, rx) = async_channel::bounded(1);
+        let source = path.clone();
+        std::thread::Builder::new()
+            .name("fileman-preview".into())
+            .spawn(move || {
+                let fits = gdk_pixbuf::Pixbuf::file_info(&source)
+                    .is_some_and(|(_, w, h)| w.max(h) <= max);
+                let decoded = if fits {
+                    gdk_pixbuf::Pixbuf::from_file(&source)
+                } else {
+                    gdk_pixbuf::Pixbuf::from_file_at_scale(&source, max, max, true)
+                };
+                let _ = tx.send_blocking(decoded.ok().map(upright).as_ref().map(RawThumb::from_pixbuf));
+            })
+            .ok()?;
+        raw = rx.recv().await.ok().flatten();
+    }
+    if raw.is_none()
+        && let Some(method) = super::thumbnailers::method_for(content_type)
+    {
+        raw = render_on_worker(method, path, max).await;
+    }
+    raw?.into_texture()
+}
+
+/// Runs an external thumbnailer on its own thread and decodes what it wrote.
+async fn render_on_worker(
+    method: super::thumbnailers::Method,
+    path: PathBuf,
+    target: i32,
+) -> Option<RawThumb> {
+    let (tx, rx) = async_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("fileman-thumbnailer".into())
+        .spawn(move || {
+            let raw = super::thumbnailers::render(&method, &path, target).and_then(|png| {
+                // Thumbnailers treat the size as a hint; some return the full
+                // frame. Scaling here keeps the cache and the tile honest.
+                let decoded = gdk_pixbuf::Pixbuf::from_file_at_scale(&png, target, target, true);
+                let _ = std::fs::remove_file(&png);
+                decoded.ok().map(upright).as_ref().map(RawThumb::from_pixbuf)
+            });
+            let _ = tx.send_blocking(raw);
+        })
+        .ok()?;
     rx.recv().await.ok().flatten()
 }
 

@@ -108,4 +108,25 @@ impl FileObject {
     pub fn replace(&self, entry: FileEntry) {
         self.imp().entry.replace(Some(entry));
     }
+
+    /// Whether this object already shows exactly what `entry` describes.
+    ///
+    /// Compares only what a row displays or acts on. A rescan produces a fresh
+    /// `FileEntry` for every file whether or not it changed, so without this
+    /// every row would be rebuilt — which is the flicker this exists to avoid.
+    pub fn shows(&self, entry: &FileEntry) -> bool {
+        let current = self.imp().entry.borrow();
+        let Some(current) = current.as_ref() else { return false };
+        current.size == entry.size
+            && current.modified == entry.modified
+            && current.is_dir == entry.is_dir
+            && current.is_symlink == entry.is_symlink
+            && current.symlink_target == entry.symlink_target
+            && current.is_hidden == entry.is_hidden
+            && current.display_name == entry.display_name
+            && current.content_type == entry.content_type
+            && current.can_read == entry.can_read
+            && current.can_write == entry.can_write
+            && current.can_execute == entry.can_execute
+    }
 }

@@ -8,6 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
 };
@@ -163,6 +164,58 @@ impl FileView {
         // Splicing the whole batch emits one items-changed instead of one per
         // row, which is the difference between a smooth and a stuttering scan.
         self.model.splice(self.model.n_items(), 0, &objects);
+    }
+
+    /// Brings the view in line with a fresh listing of the same folder,
+    /// touching only the rows that actually differ.
+    ///
+    /// The old way to show a change was to clear the model and stream the
+    /// whole folder back in. Every row was destroyed and rebuilt, so every icon
+    /// and thumbnail was dropped and reloaded — a visible flicker across the
+    /// whole window each time *anything* in the folder changed, which in a
+    /// Downloads folder with a browser writing to it is constantly.
+    ///
+    /// Here an unchanged file keeps its object, and with it its widget, its
+    /// loaded thumbnail and its place in the selection. Only files that
+    /// appeared, vanished or changed are touched.
+    pub fn apply_listing(&self, fresh: Vec<FileEntry>) {
+        // Rebinding a row makes GTK treat it as a new item, which drops it from
+        // the selection. Remembered so a selected file that merely changed
+        // stays selected.
+        let selected: HashSet<PathBuf> = self.selected_paths().into_iter().collect();
+        if merge_listing(&self.model, fresh, &selected) {
+            self.restore_selection(&selected);
+        }
+    }
+
+    /// Re-selects `paths` without scrolling — unlike [`Self::select_paths`],
+    /// which exists to jump to a result. Moving the view because a file in it
+    /// was touched in the background would be its own kind of flicker.
+    fn restore_selection(&self, paths: &HashSet<PathBuf>) {
+        let total = self.selection.n_items();
+        let wanted = gtk::Bitset::new_empty();
+        for index in 0..total {
+            if let Some(object) = self.selection.item(index).and_downcast::<FileObject>()
+                && paths.contains(&object.path())
+            {
+                wanted.add(index);
+            }
+        }
+        self.selection.set_selection(&wanted, &gtk::Bitset::new_range(0, total));
+    }
+
+    /// Every item currently shown, in the order shown — after sorting and
+    /// filtering, so stepping through a preview visits what the user sees.
+    pub fn visible_items(&self) -> Vec<FileObject> {
+        (0..self.selection.n_items())
+            .filter_map(|i| self.selection.item(i).and_downcast::<FileObject>())
+            .collect()
+    }
+
+    /// Position of the first selected item among [`Self::visible_items`].
+    pub fn first_selected_index(&self) -> Option<u32> {
+        let selected = self.selection.selection();
+        (!selected.is_empty()).then(|| selected.minimum())
     }
 
     /// Items currently selected, in view order.
@@ -509,6 +562,29 @@ impl FileView {
             glib::Propagation::Stop
         });
         widget.add_controller(keys);
+
+        // Space previews. Capture phase, because the list views bind Space to
+        // selecting the item under the cursor and would consume it before a
+        // bubble-phase handler saw it. Nothing inside the view is editable —
+        // rename is a dialog — so taking Space here cannot eat a typed space.
+        let space = gtk::EventControllerKey::new();
+        space.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        space.connect_key_pressed(move |_, key, _, state| {
+            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let modified = state.intersects(
+                gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::ALT_MASK,
+            );
+            // Ctrl+Space keeps its GTK meaning of toggling the selection.
+            if key != gdk::Key::space || modified {
+                return glib::Propagation::Proceed;
+            }
+            let _ = WidgetExt::activate_action(&this.stack, "win.preview", None);
+            glib::Propagation::Stop
+        });
+        widget.add_controller(space);
     }
 
     fn attach_drag_source(self: &Rc<Self>, widget: &gtk::Widget) {
@@ -849,6 +925,58 @@ fn tag_widget(widget: &impl IsA<gtk::Widget>, obj: &FileObject) {
     unsafe { widget.as_ref().set_data("fileman-item", obj.clone()) };
 }
 
+/// Makes `model` match `fresh`, reusing every object whose file is unchanged.
+///
+/// Returns whether a changed item was in `selected`, in which case the caller
+/// has to restore the selection — rebinding a row drops it.
+///
+/// Walked backwards so removing an item never shifts one still to be visited,
+/// and adjacent removals are gathered into one splice: a folder emptied by a
+/// bulk delete would otherwise emit one signal, and one re-sort, per file.
+fn merge_listing(
+    model: &gio::ListStore,
+    fresh: Vec<FileEntry>,
+    selected: &HashSet<PathBuf>,
+) -> bool {
+    let mut fresh: HashMap<PathBuf, FileEntry> =
+        fresh.into_iter().map(|entry| (entry.path.clone(), entry)).collect();
+    let mut reselect = false;
+
+    let mut index = model.n_items();
+    let mut run_end: Option<u32> = None;
+    while index > 0 {
+        index -= 1;
+        let Some(object) = model.item(index).and_downcast::<FileObject>() else { continue };
+        match fresh.remove(&object.path()) {
+            None => {
+                run_end.get_or_insert(index + 1);
+            }
+            Some(entry) => {
+                if let Some(end) = run_end.take() {
+                    model.splice(index + 1, end - (index + 1), &[] as &[FileObject]);
+                }
+                if !object.shows(&entry) {
+                    reselect |= selected.contains(&object.path());
+                    object.replace(entry);
+                    // Same object, new contents: this is what makes GTK rebind
+                    // the one row, and only that row.
+                    model.items_changed(index, 1, 1);
+                }
+            }
+        }
+    }
+    if let Some(end) = run_end {
+        model.splice(0, end, &[] as &[FileObject]);
+    }
+
+    // Whatever is left was not on screen before. One splice, one signal.
+    if !fresh.is_empty() {
+        let added: Vec<FileObject> = fresh.into_values().map(FileObject::new).collect();
+        model.splice(model.n_items(), 0, &added);
+    }
+    reselect
+}
+
 fn grid_factory(config: Rc<RefCell<Config>>) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let icon_size = config.borrow().icon_size;
@@ -1043,7 +1171,7 @@ fn apply_icon(
 
     image.set_from_gicon(&thumbs::icon_for(&entry.content_type, entry.is_dir, entry.is_symlink));
 
-    if !want_thumbs || entry.is_dir || entry.size > max_bytes || !thumbs::can_thumbnail(&entry.content_type) {
+    if !want_thumbs || entry.is_dir || !thumbs::worth_thumbnailing(&entry.content_type, entry.size, max_bytes) {
         return;
     }
 
@@ -1061,6 +1189,7 @@ fn apply_icon(
     unsafe { row.set_data(ALIVE_KEY, Rc::clone(&alive)) };
 
     let path = entry.path.clone();
+    let content_type = entry.content_type.clone();
     let image = image.clone();
 
     glib::spawn_future_local(async move {
@@ -1069,7 +1198,7 @@ fn apply_icon(
             move || alive.get()
         };
 
-        let Some(texture) = thumbs::load(path, mtime, size, still_current).await else {
+        let Some(texture) = thumbs::load(path, &content_type, mtime, size, still_current).await else {
             return;
         };
         if alive.get() {
@@ -1209,5 +1338,121 @@ mod name_tests {
             assert!(w >= icon, "tile must at least hold its icon");
             assert!(caption_chars_for(w) >= 8, "caption must have usable width");
         }
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::fs::entry::QUERY_ATTRS;
+
+    /// Lists a real folder the way the app does, so the entries carry real
+    /// sizes and timestamps rather than hand-built values.
+    fn scan(dir: &std::path::Path) -> Vec<FileEntry> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let info = gio::File::for_path(&path)
+                    .query_info(QUERY_ATTRS, gio::FileQueryInfoFlags::NONE, gio::Cancellable::NONE)
+                    .unwrap();
+                FileEntry::from_info(dir, &info)
+            })
+            .collect()
+    }
+
+    fn objects(model: &gio::ListStore) -> Vec<FileObject> {
+        (0..model.n_items()).filter_map(|i| model.item(i).and_downcast::<FileObject>()).collect()
+    }
+
+    fn find(model: &gio::ListStore, name: &str) -> Option<FileObject> {
+        objects(model).into_iter().find(|o| o.path().file_name().unwrap() == name)
+    }
+
+    fn loaded(dir: &std::path::Path) -> gio::ListStore {
+        let model = gio::ListStore::new::<FileObject>();
+        let objects: Vec<FileObject> = scan(dir).into_iter().map(FileObject::new).collect();
+        model.splice(0, 0, &objects);
+        model
+    }
+
+    /// The property the whole change rests on. A row's widget, and the
+    /// thumbnail loaded into it, live exactly as long as its object; replacing
+    /// the object is what made every icon flicker on any change in the folder.
+    #[test]
+    fn unchanged_files_keep_their_objects_across_a_refresh() {
+        let dir = crate::testing::TempDir::new("listing");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let model = loaded(dir.path());
+        let before = objects(&model);
+
+        // Something unrelated appears — the case that used to rebuild it all.
+        std::fs::write(dir.join("new.txt"), "x").unwrap();
+        merge_listing(&model, scan(dir.path()), &HashSet::new());
+
+        assert_eq!(model.n_items(), 4);
+        for original in &before {
+            let name = original.path().file_name().unwrap().to_owned();
+            let now = find(&model, name.to_str().unwrap()).expect("an unchanged file vanished");
+            assert_eq!(&now, original, "{name:?} was replaced by a new object");
+        }
+        assert!(find(&model, "new.txt").is_some(), "the new file was not added");
+    }
+
+    #[test]
+    fn a_refresh_that_finds_no_change_emits_nothing_at_all() {
+        let dir = crate::testing::TempDir::new("listing-quiet");
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let model = loaded(dir.path());
+
+        let signals = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = std::rc::Rc::clone(&signals);
+        model.connect_items_changed(move |_, _, _, _| counter.set(counter.get() + 1));
+
+        // A monitor event with nothing behind it — an atime update, say.
+        merge_listing(&model, scan(dir.path()), &HashSet::new());
+        assert_eq!(signals.get(), 0, "an idle refresh must not touch the view");
+    }
+
+    #[test]
+    fn deleted_files_go_and_changed_files_update_in_place() {
+        let dir = crate::testing::TempDir::new("listing-change");
+        for name in ["keep", "gone-1", "gone-2", "edit"] {
+            std::fs::write(dir.join(name), "1").unwrap();
+        }
+        let model = loaded(dir.path());
+        let edit_before = find(&model, "edit").unwrap();
+
+        std::fs::remove_file(dir.join("gone-1")).unwrap();
+        std::fs::remove_file(dir.join("gone-2")).unwrap();
+        std::fs::write(dir.join("edit"), "now a good deal longer").unwrap();
+        merge_listing(&model, scan(dir.path()), &HashSet::new());
+
+        assert_eq!(model.n_items(), 2);
+        assert!(find(&model, "gone-1").is_none() && find(&model, "gone-2").is_none());
+        let edit_after = find(&model, "edit").unwrap();
+        assert_eq!(edit_after, edit_before, "a changed file should be updated, not replaced");
+        assert_eq!(edit_after.entry().size, 22, "the new size was not applied");
+    }
+
+    /// Rebinding a changed row drops it from the selection, so the caller has
+    /// to be told — but only when it actually matters.
+    #[test]
+    fn a_selected_file_that_changed_asks_for_its_selection_back() {
+        let dir = crate::testing::TempDir::new("listing-select");
+        std::fs::write(dir.join("picked"), "1").unwrap();
+        std::fs::write(dir.join("other"), "1").unwrap();
+        let model = loaded(dir.path());
+        let picked: HashSet<PathBuf> = [dir.join("picked")].into_iter().collect();
+
+        std::fs::write(dir.join("other"), "changed").unwrap();
+        assert!(!merge_listing(&model, scan(dir.path()), &picked), "selection untouched");
+
+        std::fs::write(dir.join("picked"), "changed too").unwrap();
+        assert!(merge_listing(&model, scan(dir.path()), &picked), "selection must be restored");
     }
 }

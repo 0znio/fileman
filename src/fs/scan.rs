@@ -88,7 +88,11 @@ pub fn dir_stats(root: &Path, should_stop: &dyn Fn() -> bool) -> (u64, u64, u64)
 
     // `follow_links(false)` is what keeps a symlink loop from turning this into
     // an infinite walk, and stops a link to / from being counted as content.
-    for entry in walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+    // `same_file_system` keeps it off other disks: a drive or a cloud account
+    // mounted somewhere under home would otherwise be walked in full — over
+    // the network, for a cloud drive — just to fill in a Properties dialog.
+    let walk = walkdir::WalkDir::new(root).follow_links(false).same_file_system(true);
+    for entry in walk.into_iter().filter_map(|e| e.ok()) {
         if should_stop() {
             break;
         }

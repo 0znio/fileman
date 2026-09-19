@@ -208,16 +208,42 @@ FAMILY=$(family)
 
 # ── dependencies ────────────────────────────────────────────────────────────
 # Runtime first, then the extras needed only to compile.
+# Required: without these Fileman does not start. Installed as one transaction.
 runtime_packages() {
     case "$FAMILY" in
-        arch)   echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb gvfs-nfs rclone fuse3" ;;
-        debian) echo "libgtk-4-1 libadwaita-1-0 libarchive13t64 udisks2 ntfs-3g pigz gvfs gvfs-backends gvfs-fuse rclone fuse3" ;;
-        fedora) echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb gvfs-nfs gvfs-fuse rclone fuse3" ;;
-        suse)   echo "gtk4 libadwaita-1-0 libarchive13 udisks2 ntfs-3g pigz gvfs gvfs-backend-samba gvfs-fuse rclone fuse3" ;;
-        alpine) echo "gtk4.0 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb rclone fuse3" ;;
-        void)   echo "gtk4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs gvfs-smb rclone fuse3" ;;
-        gentoo) echo "gui-libs/gtk gui-libs/libadwaita app-arch/libarchive sys-fs/udisks sys-fs/ntfs3g app-arch/pigz gnome-base/gvfs net-misc/rclone sys-fs/fuse" ;;
-        solus)  echo "libgtk-4 libadwaita libarchive udisks2 ntfs-3g pigz gvfs rclone fuse3" ;;
+        arch)   echo "gtk4 libadwaita libarchive udisks2" ;;
+        debian) echo "libgtk-4-1 libadwaita-1-0 libarchive13t64 udisks2" ;;
+        fedora) echo "gtk4 libadwaita libarchive udisks2" ;;
+        suse)   echo "gtk4 libadwaita-1-0 libarchive13 udisks2" ;;
+        alpine) echo "gtk4.0 libadwaita libarchive udisks2" ;;
+        void)   echo "gtk4 libadwaita libarchive udisks2" ;;
+        gentoo) echo "gui-libs/gtk gui-libs/libadwaita app-arch/libarchive sys-fs/udisks" ;;
+        solus)  echo "libgtk-4 libadwaita libarchive udisks2" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Optional: each unlocks a feature, and Fileman runs without any of them.
+# Package names drift between releases of the same distro, so these are
+# allowed to fail one at a time — kept apart from the required list because a
+# single wrong name in a shared transaction makes the package manager refuse
+# the lot, GTK included.
+#
+#   ntfs-3g, pigz          NTFS repair, fast .tar.gz
+#   gvfs + backends        network shares (SMB, NFS, ...)
+#   rclone, fuse3          cloud drives
+#   ffmpeg, poppler        video and PDF thumbnails
+#   gstreamer good, libav  video and audio playing in the preview
+optional_packages() {
+    case "$FAMILY" in
+        arch)   echo "ntfs-3g pigz gvfs gvfs-smb gvfs-nfs rclone fuse3 ffmpeg poppler gst-plugins-good gst-libav" ;;
+        debian) echo "ntfs-3g pigz gvfs gvfs-backends gvfs-fuse rclone fuse3 ffmpeg poppler-utils gstreamer1.0-plugins-good gstreamer1.0-libav" ;;
+        fedora) echo "ntfs-3g pigz gvfs gvfs-smb gvfs-nfs gvfs-fuse rclone fuse3 ffmpeg-free poppler-utils gstreamer1-plugins-good gstreamer1-plugin-libav" ;;
+        suse)   echo "ntfs-3g pigz gvfs gvfs-backend-samba gvfs-fuse rclone fuse3 ffmpeg poppler-tools gstreamer-plugins-good gstreamer-plugins-libav" ;;
+        alpine) echo "ntfs-3g pigz gvfs gvfs-smb rclone fuse3 ffmpeg poppler-utils gst-plugins-good gst-libav" ;;
+        void)   echo "ntfs-3g pigz gvfs gvfs-smb rclone fuse3 ffmpeg poppler gst-plugins-good1 gst-libav" ;;
+        gentoo) echo "sys-fs/ntfs3g app-arch/pigz gnome-base/gvfs net-misc/rclone sys-fs/fuse media-video/ffmpeg app-text/poppler media-libs/gst-plugins-good media-plugins/gst-plugins-libav" ;;
+        solus)  echo "ntfs-3g pigz gvfs rclone fuse3 ffmpeg poppler gstreamer-1.0-plugins-good gstreamer-1.0-libav" ;;
         *)      echo "" ;;
     esac
 }
@@ -238,7 +264,10 @@ install_packages() {
     [ $# -gt 0 ] || return 0
     case "$FAMILY" in
         arch)   as_root pacman -S --needed --noconfirm "$@" ;;
-        debian) as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        debian) if [ -z "${APT_UPDATED:-}" ]; then
+                    as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                    APT_UPDATED=1
+                fi
                 as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" ;;
         fedora) if have dnf; then as_root dnf install -y "$@"; else as_root yum install -y "$@"; fi ;;
         suse)   as_root zypper --non-interactive install "$@" ;;
@@ -265,6 +294,7 @@ install_deps() {
         warn "  gtk4 (>= $MIN_GTK), libadwaita (>= $MIN_ADW), libarchive, udisks2"
         warn "  optional: ntfs-3g (NTFS repair), pigz (fast .tar.gz)"
         warn "  optional: gvfs + gvfs-smb (network shares), rclone + fuse3 (cloud drives)"
+        warn "  optional: ffmpeg, poppler (video/PDF thumbnails), gstreamer good + libav plugins (media preview)"
         return 0
     fi
 
@@ -276,9 +306,23 @@ install_deps() {
         if [ "$FAMILY" = "debian" ]; then
             warn "retrying with the pre-time_t libarchive name"
             pkgs=$(echo "$pkgs" | sed 's/libarchive13t64/libarchive13/')
-            install_packages $pkgs || warn "some packages failed; continuing"
+            install_packages $pkgs || warn "some required packages failed; continuing"
         else
-            warn "some packages failed to install; continuing"
+            warn "some required packages failed to install; continuing"
+        fi
+    fi
+
+    # All at once first, which is fast when every name is right. If the
+    # package manager refuses the batch, one at a time, so one unknown name
+    # costs only its own feature.
+    opts=$(optional_packages)
+    if [ -n "$opts" ]; then
+        say "Installing optional extras"
+        if ! install_packages $opts; then
+            warn "retrying optional packages one at a time"
+            for p in $opts; do
+                install_packages "$p" >/dev/null 2>&1 || warn "  optional package not available here: $p"
+            done
         fi
     fi
     ok "dependencies done"
@@ -482,6 +526,8 @@ esac
 have pigz    || warn "pigz not installed — .tar.gz creation stays single-threaded"
 have ntfsfix || warn "ntfs-3g not installed — NTFS repair will be unavailable"
 have rclone  || warn "rclone not installed — cloud drives will be unavailable"
+have ffmpeg  || warn "ffmpeg not installed — videos will have no thumbnails"
+have pdftoppm || warn "poppler not installed — PDFs will have no thumbnails"
 # Cloud drives are FUSE mounts, so the unmount helper is as required as rclone.
 have fusermount3 || have fusermount || \
     warn "fuse3 not installed — cloud drives cannot be mounted"

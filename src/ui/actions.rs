@@ -62,6 +62,8 @@ impl Window {
             }
         });
         self.simple("open-with", |this| this.open_with());
+        self.simple("preview", |this| this.toggle_preview());
+        self.simple("disk-usage", |this| this.show_disk_usage());
         self.simple("new-folder", |this| this.create_new(true));
         self.simple("new-file", |this| this.create_new(false));
         self.simple("rename", |this| this.rename_selected());
@@ -402,16 +404,39 @@ impl Window {
 
             match result {
                 Ok(path) => {
-                    this.reload();
                     // Select the new item so it can be renamed immediately.
-                    let weak = Rc::downgrade(&this);
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                        if let Some(this) = weak.upgrade() {
-                            this.view().select_paths(&[path]);
-                        }
-                    });
+                    this.reload_and_select(vec![path]);
                 }
                 Err(err) => dialogs::show_error(&this.widget(), "Could not create item", &err),
+            }
+        });
+    }
+
+    /// Several items selected: the batch dialog, then a collision-safe rename.
+    fn rename_many(self: &Rc<Self>, entries: Vec<FileEntry>) {
+        let this = Rc::clone(self);
+        glib::spawn_future_local(async move {
+            // In the order they are shown, so "Number them" numbers them the
+            // way the user sees them rather than in selection-click order.
+            let files: Vec<(PathBuf, bool)> =
+                entries.iter().map(|e| (e.path.clone(), e.is_dir)).collect();
+            let Some(plan) = crate::ui::batch_rename::ask(&this.widget(), files).await else {
+                return;
+            };
+            let result =
+                run_off_thread(move || crate::fs::batch_rename::execute(&plan)).await;
+            match result {
+                Ok(renamed) => {
+                    let count = renamed.len();
+                    this.reload_and_select(renamed);
+                    this.toast(&format!("Renamed {count} item{}", if count == 1 { "" } else { "s" }));
+                }
+                Err(err) => {
+                    // The folder may be part-renamed if the undo itself hit
+                    // trouble, so show it as it really is now.
+                    this.reload();
+                    dialogs::show_error(&this.widget(), "The files were not renamed", &err);
+                }
             }
         });
     }
@@ -419,12 +444,12 @@ impl Window {
     fn rename_selected(self: &Rc<Self>) {
         let entries = self.selected_or_toast("rename");
         let Some(entry) = entries.first().cloned() else { return };
-        if entries.len() > 1 {
-            self.toast("Renaming several items at once isn't supported yet");
-            return;
-        }
         if self.in_trash() {
             self.toast("Restore this item before renaming it");
+            return;
+        }
+        if entries.len() > 1 {
+            self.rename_many(entries);
             return;
         }
 
@@ -448,13 +473,7 @@ impl Window {
 
             match ops::rename_in_place(&entry.path, &name) {
                 Ok(path) => {
-                    this.reload();
-                    let weak = Rc::downgrade(&this);
-                    glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                        if let Some(this) = weak.upgrade() {
-                            this.view().select_paths(&[path]);
-                        }
-                    });
+                    this.reload_and_select(vec![path]);
                 }
                 Err(err) => dialogs::show_error(&this.widget(), "Could not rename", &err),
             }
@@ -598,16 +617,7 @@ impl Window {
                     if outcome.items_done == 1 { "" } else { "s" }
                 ));
             }
-            this.reload();
-            let created = outcome.created.clone();
-            if !created.is_empty() {
-                let weak = Rc::downgrade(&this);
-                glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                    if let Some(this) = weak.upgrade() {
-                        this.view().select_paths(&created);
-                    }
-                });
-            }
+            this.reload_and_select(outcome.created.clone());
         });
     }
 
@@ -777,14 +787,7 @@ impl Window {
                 ));
             }
 
-            this.reload();
-            let created = outcome.created.clone();
-            let weak = Rc::downgrade(&this);
-            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-                if let Some(this) = weak.upgrade() {
-                    this.view().select_paths(&created);
-                }
-            });
+            this.reload_and_select(outcome.created.clone());
         });
     }
 
@@ -861,14 +864,7 @@ impl Window {
             ));
         }
 
-        self.reload();
-        let created = outcome.created.clone();
-        let weak = Rc::downgrade(self);
-        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-            if let Some(this) = weak.upgrade() {
-                this.view().select_paths(&created);
-            }
-        });
+        self.reload_and_select(outcome.created.clone());
     }
 
     fn compress_selected(self: &Rc<Self>) {
@@ -1669,6 +1665,83 @@ impl Window {
         self.toast("No terminal emulator found");
     }
 
+    /// Opens the disk usage window on the selected folder, or on the folder
+    /// being viewed when no single folder is selected.
+    fn show_disk_usage(self: &Rc<Self>) {
+        let selected = self.selected_entries();
+        let target = match selected.as_slice() {
+            [only] if only.is_dir => only.path.clone(),
+            _ => match self.current_dir() {
+                Some(dir) => dir,
+                None => {
+                    self.transient_toast("Open a folder to see its disk usage");
+                    return;
+                }
+            },
+        };
+
+        let window = self.usage.borrow().clone();
+        let window = window.unwrap_or_else(|| {
+            let include_hidden = self.config.borrow().show_hidden;
+            let window = crate::ui::usage::UsageWindow::new(&self.window, include_hidden);
+            let weak = Rc::downgrade(self);
+            window.connect_open(move |path| {
+                if let Some(this) = weak.upgrade() {
+                    // A folder is navigated to; a file is revealed where it is.
+                    this.open_path(path);
+                    this.window.present();
+                }
+            });
+            *self.usage.borrow_mut() = Some(Rc::clone(&window));
+            window
+        });
+        window.show(&target);
+    }
+
+    /// Space: preview the selected file, or close the preview if it is open.
+    fn toggle_preview(self: &Rc<Self>) {
+        let preview = self.preview.borrow().clone();
+        if let Some(preview) = &preview
+            && preview.is_open()
+        {
+            preview.close();
+            return;
+        }
+
+        let view = self.view();
+        let Some(index) = view.first_selected_index() else {
+            self.transient_toast("Select a file to preview");
+            return;
+        };
+
+        let preview = preview.unwrap_or_else(|| {
+            let preview = crate::ui::preview::Preview::new(&self.window);
+            let weak = Rc::downgrade(self);
+            preview.connect_open(move |path| {
+                let Some(this) = weak.upgrade() else { return };
+                // A folder is entered; a file is opened in its application.
+                // `open_path` alone would only reveal the file, which is where
+                // the user already is.
+                if path.is_dir() {
+                    this.open_path(path);
+                } else {
+                    this.launch(&path);
+                }
+            });
+            // Stepping through files moves the selection with it, so closing
+            // the preview leaves you on the file you were last looking at.
+            let weak = Rc::downgrade(self);
+            preview.connect_moved(move |path| {
+                if let Some(this) = weak.upgrade() {
+                    this.view().select_paths(&[path]);
+                }
+            });
+            *self.preview.borrow_mut() = Some(Rc::clone(&preview));
+            preview
+        });
+        preview.show(view.visible_items(), index as usize);
+    }
+
     fn open_with(self: &Rc<Self>) {
         let entries = self.selected_or_toast("open");
         let Some(entry) = entries.first().cloned() else { return };
@@ -1981,6 +2054,7 @@ impl Window {
             menu.item("Open Terminal Here", "win.open-terminal", Some("Ctrl+Alt+T"));
             menu.item("Add to Favourites", "win.add-favourite", Some("Ctrl+D"));
             menu.section();
+            menu.item("Disk Usage", "win.disk-usage", None);
             menu.item("Properties", "win.properties", Some("Alt+Return"));
         } else {
             let single = selection.len() == 1;
@@ -1994,14 +2068,13 @@ impl Window {
             if single && !selection[0].is_dir {
                 menu.item("Open With…", "win.open-with", None);
             }
+            menu.item("Preview", "win.preview", Some("Space"));
 
             menu.section();
             menu.item("Cut", "win.cut", Some("Ctrl+X"));
             menu.item("Copy", "win.copy", Some("Ctrl+C"));
             menu.item("Copy Path", "win.copy-path", Some("Ctrl+Shift+C"));
-            if single {
-                menu.item("Rename…", "win.rename", Some("F2"));
-            }
+            menu.item(if single { "Rename…" } else { "Rename Several…" }, "win.rename", Some("F2"));
 
             menu.section();
             if has_archive {
@@ -2018,6 +2091,9 @@ impl Window {
             menu.section();
             if has_dir {
                 menu.item("Add to Favourites", "win.add-favourite", Some("Ctrl+D"));
+            }
+            if single && has_dir {
+                menu.item("Disk Usage", "win.disk-usage", None);
             }
             menu.item("Properties", "win.properties", Some("Alt+Return"));
         }

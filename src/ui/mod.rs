@@ -1,14 +1,18 @@
 pub mod accent;
 pub mod actions;
+pub mod batch_rename;
 pub mod connect;
 pub mod dialogs;
 pub mod file_object;
 pub mod file_view;
 pub mod menu;
 pub mod pathbar;
+pub mod preview;
 pub mod progress;
 pub mod properties;
 pub mod sidebar;
+pub mod thumbnailers;
+pub mod usage;
 pub mod thumbs;
 pub mod window;
 

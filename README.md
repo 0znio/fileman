@@ -78,9 +78,28 @@ Optional: `pigz` (threaded `.tar.gz`), `ntfs-3g` (dirty NTFS), `ntfsprogs`
 ## What it does
 
 **Browsing** — tabs with their own history and scroll position · icon grid and
-details list · breadcrumb that becomes an editable path · recursive search that
-streams results as it walks · thumbnails from the shared freedesktop cache ·
-drag and drop · light/dark and a pick-your-own accent colour.
+details list · breadcrumb that becomes an editable path · drag and drop ·
+light/dark and a pick-your-own accent colour.
+
+**Preview** — press `Space` on a file to see it without opening anything:
+images, PDFs and office documents, text and code, and video or audio playing in
+place. Arrow keys step through the folder; `Enter` opens the file.
+
+**Thumbnails** — photos, video, PDF and office documents, the right way up. Uses
+whatever thumbnailers your system has registered, falls back to `ffmpeg` and
+`pdftoppm`, and shares everything through the freedesktop cache.
+
+**Search** — by name, or by what's inside files with the **Contents** toggle.
+Both walk the tree in the background and stream results as they're found.
+Content search skips binaries and reads on several threads.
+
+**Rename many at once** — select several and press `F2`: find and replace,
+number them, or change case, with every new name previewed and clashes flagged
+before anything moves. Swaps and renumbered series are handled safely.
+
+**Disk usage** — which folders are eating the drive, largest first, with a bar
+for each one's share. Click through to drill down. Measures space actually used,
+stays on one disk, and counts hard links once — the way `du -x` does.
 
 **Drives** — every mountable volume in the sidebar with a capacity ring, grouped
 into Removable, Windows and internal. Mounts through UDisks2 as your own user:
@@ -165,7 +184,8 @@ stutter. Settings → Performance overrides it.
 | `Ctrl+T` / `Ctrl+W` / `Ctrl+Tab` | New tab / close / cycle |
 | `Alt+←` `Alt+→` `Alt+↑` | Back / forward / up |
 | `Ctrl+L` / `Ctrl+F` / `Ctrl+H` | Edit path / search / hidden files |
-| `F2` · `Delete` · `Shift+Delete` · `Ctrl+Shift+Delete` | Rename · trash · delete · shred |
+| `Space` | Preview (arrows step through, `Enter` opens) |
+| `F2` · `Delete` · `Shift+Delete` · `Ctrl+Shift+Delete` | Rename (several at once too) · trash · delete · shred |
 | `Ctrl+E` / `Ctrl+Shift+E` | Extract here / compress |
 | `Ctrl+Shift+D` | Download from a URL |
 | `Ctrl+D` / `Ctrl+Shift+V` / `Alt+Return` / `F9` | Favourite / grid↔list / properties / sidebar |
@@ -230,10 +250,11 @@ widget.
 
 ## Known gaps
 
-No split view · renaming several files at once · video and document thumbnails ·
-search matches names, not contents · each network protocol needs its own gvfs
-backend installed, and the connect dialog says which · not yet a desktop
-file-chooser backend, so browsers still use the GTK save dialog.
+No split view · each network protocol needs its own gvfs backend installed, and
+the connect dialog says which · video plays in the preview only when GStreamer
+has the codec (`gst-plugins-good`, `gst-libav`), otherwise it shows a still frame
+· not yet a desktop file-chooser backend, so browsers still use the GTK save
+dialog.
 
 ## Licence
 

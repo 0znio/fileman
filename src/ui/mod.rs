@@ -6,6 +6,7 @@ pub mod dialogs;
 pub mod file_object;
 pub mod file_view;
 pub mod menu;
+pub mod open_with;
 pub mod pathbar;
 pub mod preview;
 pub mod progress;

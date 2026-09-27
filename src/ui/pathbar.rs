@@ -41,6 +41,8 @@ pub struct PathBar {
     current: RefCell<PathBuf>,
     /// Invoked when the user picks a crumb or commits the entry.
     on_navigate: Callback<PathBuf>,
+    /// Invoked when a typed location cannot be opened.
+    on_error: Callback<String>,
     /// Guards the entry's `changed` handler while we rewrite its text, so
     /// inline completion doesn't recurse.
     updating: std::cell::Cell<bool>,
@@ -98,6 +100,7 @@ impl PathBar {
             entry,
             current: RefCell::new(PathBuf::from("/")),
             on_navigate: RefCell::new(None),
+            on_error: RefCell::new(None),
             updating: std::cell::Cell::new(false),
         });
 
@@ -111,6 +114,11 @@ impl PathBar {
 
     pub fn connect_navigate(&self, f: impl Fn(PathBuf) + 'static) {
         *self.on_navigate.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Reports a typed location that could not be opened.
+    pub fn connect_error(&self, f: impl Fn(String) + 'static) {
+        *self.on_error.borrow_mut() = Some(Rc::new(f));
     }
 
     fn navigate(&self, path: PathBuf) {
@@ -188,8 +196,16 @@ impl PathBar {
                 let Ok(text) = clipboard.read_text_future().await else { return };
                 let Some(text) = text else { return };
                 let Some(this) = weak_inner.upgrade() else { return };
-                if let Some(path) = this.resolve(text.as_str()) {
-                    this.navigate(path);
+                // A pasted selection is often not a path at all, so a failure
+                // here is reported the same way a typed one is rather than
+                // being swallowed.
+                match this.resolve(text.as_str()) {
+                    Ok(path) => this.navigate(path),
+                    Err(problem) => {
+                        if let Some(message) = problem.message() {
+                            emit(&this.on_error, message);
+                        }
+                    }
                 }
             });
         });
@@ -200,14 +216,19 @@ impl PathBar {
             let Some(this) = weak.upgrade() else { return };
             let text = entry.text().to_string();
             match this.resolve(&text) {
-                Some(path) => {
+                Ok(path) => {
                     this.show_crumbs();
                     this.navigate(path);
                 }
-                None => {
+                Err(problem) => {
                     // Leave the text in place so the user can fix a typo rather
-                    // than retyping the whole path.
+                    // than retyping the whole path, and say what is wrong with
+                    // it. Reddening the box was the only feedback before, which
+                    // in a dark theme reads as nothing happening at all.
                     entry.add_css_class("error");
+                    if let Some(message) = problem.message() {
+                        emit(&this.on_error, message);
+                    }
                 }
             }
         });
@@ -425,33 +446,9 @@ impl PathBar {
     ///
     /// Accepts `~`, `file://` URIs, environment variables and paths relative to
     /// the current directory, because all four turn up in things people paste.
-    fn resolve(&self, text: &str) -> Option<PathBuf> {
-        let text = text.trim();
-        if text.is_empty() {
-            return None;
-        }
-
-        let expanded = if let Some(rest) = text.strip_prefix("file://") {
-            urlencoding::decode(rest).ok()?.into_owned()
-        } else if text == "~" {
-            dirs::home_dir()?.to_string_lossy().into_owned()
-        } else if let Some(rest) = text.strip_prefix("~/") {
-            dirs::home_dir()?.join(rest).to_string_lossy().into_owned()
-        } else {
-            expand_env(text)
-        };
-
-        let path = PathBuf::from(expanded);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            self.current.borrow().join(path)
-        };
-
-        // Normalising here means `..` in a typed path works even when the
-        // intermediate directory is a symlink the user didn't intend to follow.
-        let normalized = normalize(&path);
-        normalized.exists().then_some(normalized)
+    fn resolve(&self, text: &str) -> Result<PathBuf, BadLocation> {
+        let current = self.current.borrow().clone();
+        resolve_text(text, &current)
     }
 
     /// Appends the unique completion of the trailing path segment, selecting
@@ -505,6 +502,75 @@ impl PathBar {
 }
 
 /// Expands `$VAR` and `${VAR}` occurrences, leaving unknown names untouched.
+/// Why a typed location could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BadLocation {
+    /// Nothing was typed; not worth complaining about.
+    Empty,
+    /// A URI for something that is not a local file.
+    Unsupported(String),
+    Missing(PathBuf),
+}
+
+impl BadLocation {
+    /// What to tell the user, or `None` when there is nothing to say.
+    fn message(&self) -> Option<String> {
+        match self {
+            BadLocation::Empty => None,
+            BadLocation::Unsupported(scheme) => Some(format!(
+                "{scheme}:// addresses aren't opened by typing them here —                  use Connect to Server in the sidebar"
+            )),
+            BadLocation::Missing(path) => Some(format!("There is no “{}”", path.display())),
+        }
+    }
+}
+
+/// Turns typed text into a path that exists, or says why it cannot.
+///
+/// Kept free of the widget so every accepted and rejected form can be tested:
+/// absolute and relative paths, `~`, environment variables, `file://` URIs and
+/// percent-encoding all have to keep working, and a wrong answer here is a
+/// navigation that silently does nothing.
+fn resolve_text(text: &str, current: &Path) -> Result<PathBuf, BadLocation> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(BadLocation::Empty);
+    }
+
+    let expanded = if let Some(rest) = text.strip_prefix("file://") {
+        urlencoding::decode(rest).map(|s| s.into_owned()).unwrap_or_else(|_| rest.to_string())
+    } else if let Some((scheme, _)) = text.split_once("://") {
+        // `smb://` and friends are real locations, just not ones a path can
+        // reach. Saying where they *are* handled beats "there is no such
+        // folder", which is both unhelpful and untrue.
+        return Err(BadLocation::Unsupported(scheme.to_lowercase()));
+    } else if text == "~" {
+        match dirs::home_dir() {
+            Some(home) => home.to_string_lossy().into_owned(),
+            None => return Err(BadLocation::Missing(PathBuf::from("~"))),
+        }
+    } else if let Some(rest) = text.strip_prefix("~/") {
+        match dirs::home_dir() {
+            Some(home) => home.join(rest).to_string_lossy().into_owned(),
+            None => return Err(BadLocation::Missing(PathBuf::from(text))),
+        }
+    } else {
+        expand_env(text)
+    };
+
+    let path = PathBuf::from(expanded);
+    let path = if path.is_absolute() { path } else { current.join(path) };
+
+    // Normalising here means `..` in a typed path works even when the
+    // intermediate directory is a symlink the user didn't intend to follow.
+    let normalized = normalize(&path);
+    if normalized.exists() {
+        Ok(normalized)
+    } else {
+        Err(BadLocation::Missing(normalized))
+    }
+}
+
 fn expand_env(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -573,5 +639,121 @@ mod tests {
         assert_eq!(expand_env("$FILEMAN_TEST_DIR/y"), "/tmp/x/y");
         assert_eq!(expand_env("${FILEMAN_TEST_DIR}/y"), "/tmp/x/y");
         assert_eq!(expand_env("$NOT_SET_ANYWHERE_12345/y"), "$NOT_SET_ANYWHERE_12345/y");
+    }
+}
+
+#[cfg(test)]
+mod activate_tests {
+    use super::*;
+
+    /// Every accepted form, resolved against a known folder.
+    #[test]
+    fn typed_locations_resolve_to_real_paths() {
+        let dir = crate::testing::TempDir::new("pathbar");
+        std::fs::create_dir_all(dir.join("sub dir")).unwrap();
+        std::fs::write(dir.join("file.txt"), b"x").unwrap();
+        let root = dir.path();
+
+        let ok = |text: &str| resolve_text(text, root).expect(text);
+        // Absolute, relative, and trailing slashes.
+        assert_eq!(ok(root.to_str().unwrap()), root);
+        assert_eq!(ok("sub dir"), dir.join("sub dir"));
+        assert_eq!(ok("sub dir/"), dir.join("sub dir"));
+        assert_eq!(ok("./sub dir/../sub dir"), dir.join("sub dir"));
+        // A file is a location too; the window reveals it.
+        assert_eq!(ok("file.txt"), dir.join("file.txt"));
+        // Whitespace around a pasted path.
+        assert_eq!(ok("  sub dir  "), dir.join("sub dir"));
+        // Home, and a file:// URI with percent-encoding.
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(ok("~"), home);
+        }
+        let encoded = format!("file://{}", dir.join("sub dir").display()).replace(' ', "%20");
+        assert_eq!(ok(&encoded), dir.join("sub dir"), "percent-encoded URI");
+    }
+
+    /// The silent failure: a path that does not exist used to tint the box red
+    /// and say nothing, which in a dark theme looks like nothing happened.
+    #[test]
+    fn a_missing_folder_is_reported_rather_than_ignored() {
+        let dir = crate::testing::TempDir::new("pathbar-missing");
+        let problem = resolve_text("nope/not-here", dir.path()).unwrap_err();
+        let message = problem.message().expect("a missing path must be explained");
+        assert!(message.contains("not-here"), "{message}");
+        assert!(matches!(problem, BadLocation::Missing(_)));
+    }
+
+    /// Typing a remote address is a reasonable thing to try, and "there is no
+    /// such folder" would be both unhelpful and untrue.
+    #[test]
+    fn a_remote_address_points_at_connect_to_server() {
+        for text in ["smb://nas/media", "sftp://box.dev/srv", "SMB://NAS/Media"] {
+            let problem = resolve_text(text, Path::new("/")).unwrap_err();
+            let message = problem.message().expect("a remote address must be explained");
+            assert!(message.contains("Connect to Server"), "{text}: {message}");
+        }
+        // `file://` is local and must still work.
+        assert!(resolve_text("file:///", Path::new("/")).is_ok());
+    }
+
+    #[test]
+    fn an_empty_entry_says_nothing() {
+        let problem = resolve_text("   ", Path::new("/")).unwrap_err();
+        assert_eq!(problem, BadLocation::Empty);
+        assert_eq!(problem.message(), None, "an empty box is not a mistake to report");
+    }
+
+    /// Drives the real widget. GTK may only be used from the thread that
+    /// initialised it and the test harness gives each test its own, so every
+    /// widget-level check lives in this one test.
+    #[test]
+    fn the_entry_navigates_on_enter_and_explains_when_it_cannot() {
+        if gtk::init().is_err() {
+            eprintln!("skipped: no display");
+            return;
+        }
+        let bar = PathBar::new();
+        let seen: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+        let errors: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let (seen, errors) = (Rc::clone(&seen), Rc::clone(&errors));
+            bar.connect_navigate(move |path| seen.borrow_mut().push(path));
+            bar.connect_error(move |message| errors.borrow_mut().push(message));
+        }
+        let enter = |bar: &Rc<PathBar>, text: &str| {
+            bar.start_editing();
+            bar.entry.set_text(text);
+            bar.entry.emit_by_name::<()>("activate", &[]);
+        };
+
+        // The sequence a user performs: reveal the path, replace it, Enter.
+        bar.set_path(Path::new("/usr"));
+        enter(&bar, "/tmp");
+        assert_eq!(seen.borrow().as_slice(), [PathBuf::from("/tmp")], "Enter did not navigate");
+        assert!(errors.borrow().is_empty());
+
+        // Whatever inline completion left in the box is what gets opened, so
+        // the user can read beforehand exactly where Enter will take them.
+        let shown = {
+            bar.start_editing();
+            bar.entry.set_text("/usr/share");
+            bar.entry.text().to_string()
+        };
+        bar.entry.emit_by_name::<()>("activate", &[]);
+        let expected = resolve_text(&shown, Path::new("/usr")).expect("the shown text must resolve");
+        assert_eq!(seen.borrow().last(), Some(&expected));
+
+        // A path that does not exist must say so and go nowhere.
+        let before = seen.borrow().len();
+        enter(&bar, "/definitely/not/here");
+        assert_eq!(seen.borrow().len(), before, "it navigated somewhere that does not exist");
+        assert_eq!(errors.borrow().len(), 1, "nothing was reported");
+        assert!(errors.borrow()[0].contains("/definitely/not/here"), "{:?}", errors.borrow());
+
+        // Escape abandons the edit without navigating.
+        bar.start_editing();
+        assert_eq!(bar.stack.visible_child_name().as_deref(), Some("entry"));
+        bar.show_crumbs();
+        assert_eq!(bar.stack.visible_child_name().as_deref(), Some("crumbs"));
     }
 }

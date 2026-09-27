@@ -428,6 +428,13 @@ impl Window {
             this.open_path(path);
         });
 
+        let weak = Rc::downgrade(self);
+        self.pathbar.connect_error(move |message| {
+            if let Some(this) = weak.upgrade() {
+                this.transient_toast(&message);
+            }
+        });
+
         self.wire_view(&self.view());
 
         // Switching tabs changes what every piece of shared chrome is talking

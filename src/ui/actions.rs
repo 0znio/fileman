@@ -1744,65 +1744,52 @@ impl Window {
 
     fn open_with(self: &Rc<Self>) {
         let entries = self.selected_or_toast("open");
-        let Some(entry) = entries.first().cloned() else { return };
-
-        let apps = gio::AppInfo::recommended_for_type(&entry.content_type);
-        let all = gio::AppInfo::all_for_type(&entry.content_type);
-        // Recommended apps come first, then anything else that claims the type.
-        let mut ordered = apps.clone();
-        for app in all {
-            if !ordered.iter().any(|a| a.id() == app.id()) {
-                ordered.push(app);
-            }
+        if entries.is_empty() {
+            return;
         }
-
-        if ordered.is_empty() {
-            self.toast("No applications are registered for this file type");
+        if entries.iter().any(|entry| entry.is_dir) {
+            self.toast("Choose files rather than folders to open with an application");
             return;
         }
 
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Single)
-            .css_classes(["boxed-list"])
-            .build();
-
-        for app in &ordered {
-            let row = adw::ActionRow::builder().title(app.display_name().as_str()).build();
-            if let Some(icon) = app.icon() {
-                row.add_prefix(&gtk::Image::from_gicon(&icon));
-            }
-            list.append(&row);
-        }
-
-        let dialog = adw::AlertDialog::new(
-            Some("Open With"),
-            Some(&format!("Choose an application for “{}”.", entry.display_name)),
-        );
-        let scroller = gtk::ScrolledWindow::builder()
-            .height_request(280)
-            .propagate_natural_height(true)
-            .child(&list)
-            .margin_top(8)
-            .build();
-        dialog.set_extra_child(Some(&scroller));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("open", "Open");
-        dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("open"));
-        dialog.set_close_response("cancel");
+        let content_type = entries[0].content_type.clone();
+        let mixed = entries.iter().any(|entry| entry.content_type != content_type);
+        let names: Vec<String> = entries.iter().map(|entry| entry.display_name.clone()).collect();
 
         let this = Rc::clone(self);
         glib::spawn_future_local(async move {
-            let response = dialog.choose_future(Some(&this.widget())).await;
-            if response != "open" {
+            let Some(choice) =
+                crate::ui::open_with::ask(&this.widget(), &names, &content_type, mixed).await
+            else {
                 return;
-            }
-            let Some(index) = list.selected_row().map(|r| r.index()) else { return };
-            let Some(app) = ordered.get(index as usize) else { return };
+            };
 
-            let file = gio::File::for_path(&entry.path);
-            if let Err(err) = app.launch(&[file], None::<&gio::AppLaunchContext>) {
-                dialogs::show_error(&this.widget(), "Could not open the file", err.message());
+            if choice.set_default
+                && let Err(err) = choice.app.set_as_default_for_type(&content_type)
+            {
+                this.toast(&format!("Could not set the default: {}", err.message()));
+            } else if !mixed {
+                // Not the default, but remembered: GIO orders its
+                // recommendations by what was last used for the type, so the
+                // application the user just picked comes first next time.
+                let _ = choice.app.set_as_last_used_for_type(&content_type);
+            }
+
+            // Everything selected goes to one launch, so a media player opens
+            // a playlist rather than five copies of itself.
+            let files: Vec<gio::File> = entries.iter().map(|e| gio::File::for_path(&e.path)).collect();
+            match choice.app.launch(&files, None::<&gio::AppLaunchContext>) {
+                Ok(()) => {
+                    if choice.set_default {
+                        this.toast(&format!(
+                            "{} now opens these files by default",
+                            choice.app.display_name()
+                        ));
+                    }
+                }
+                Err(err) => {
+                    dialogs::show_error(&this.widget(), "Could not open the file", err.message())
+                }
             }
         });
     }
@@ -2065,7 +2052,7 @@ impl Window {
             if selection.iter().any(|entry| entry.is_dir) {
                 menu.item("Open in New Tab", "win.open-in-new-tab", None);
             }
-            if single && !selection[0].is_dir {
+            if !has_dir {
                 menu.item("Open With…", "win.open-with", None);
             }
             menu.item("Preview", "win.preview", Some("Space"));

@@ -37,28 +37,16 @@ pub async fn ask_server(
         .collect();
     let model = gtk::StringList::new(&names.iter().map(String::as_str).collect::<Vec<_>>());
 
-    let protocol = gtk::DropDown::builder().model(&model).valign(gtk::Align::Center).build();
+    let protocol = adw::ComboRow::builder().title("Protocol").model(&model).build();
     let selected = initial
         .as_ref()
         .and_then(|server| schemes.iter().position(|s| *s == server.scheme))
         .unwrap_or(0);
     protocol.set_selected(selected as u32);
 
-    let address = gtk::Entry::builder()
-        .placeholder_text("nas.local/media")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let user = gtk::Entry::builder()
-        .placeholder_text("Optional")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let label = gtk::Entry::builder()
-        .placeholder_text("Optional")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
+    let address = adw::EntryRow::builder().title("Address").build();
+    let user = adw::EntryRow::builder().title("Username").build();
+    let label = adw::EntryRow::builder().title("Name in the sidebar").build();
 
     if let Some(server) = &initial {
         let mut text = server.host.clone();
@@ -82,16 +70,10 @@ pub async fn ask_server(
         .build();
 
     let group = adw::PreferencesGroup::new();
-    for (title, widget) in [
-        ("Protocol", protocol.clone().upcast::<gtk::Widget>()),
-        ("Address", address.clone().upcast()),
-        ("Username", user.clone().upcast()),
-        ("Name in sidebar", label.clone().upcast()),
-    ] {
-        let row = adw::ActionRow::builder().title(title).build();
-        row.add_suffix(&widget);
-        group.add(&row);
-    }
+    group.add(&protocol);
+    group.add(&address);
+    group.add(&user);
+    group.add(&label);
 
     let cancel = gtk::Button::with_label("Cancel");
     let accept = gtk::Button::builder()
@@ -99,33 +81,30 @@ pub async fn ask_server(
         .css_classes(["suggested-action"])
         .sensitive(false)
         .build();
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .margin_top(8)
-        .build();
-    buttons.append(&cancel);
-    buttons.append(&accept);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
         .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
+        .margin_bottom(14)
+        .margin_start(14)
+        .margin_end(14)
         .build();
     body.append(&group);
     body.append(&status);
-    body.append(&buttons);
+
+    let title = if initial.is_some() { "Edit connection" } else { "Connect to Server" };
+    let header = adw::HeaderBar::builder().show_end_title_buttons(false).build();
+    header.set_title_widget(Some(&adw::WindowTitle::new(title, "")));
+    header.pack_start(&cancel);
+    header.pack_end(&accept);
 
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&body));
     let dialog = adw::Dialog::builder()
-        .title(if initial.is_some() { "Edit connection" } else { "Connect to server" })
-        .content_width(560)
+        .title(title)
+        .content_width(500)
         .child(&toolbar)
         .build();
 
@@ -222,87 +201,38 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
 
     let providers = Provider::OFFERED.to_vec();
     let names: Vec<&str> = providers.iter().map(|p| p.label()).collect();
-    let provider = gtk::DropDown::builder()
+    let provider = adw::ComboRow::builder()
+        .title("Provider")
         .model(&gtk::StringList::new(&names))
-        .valign(gtk::Align::Center)
         .build();
 
-    let name = gtk::Entry::builder()
-        .placeholder_text("you@gmail.com, or “Work drive”")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let username = gtk::Entry::builder()
-        .placeholder_text("you@example.com")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let password = gtk::PasswordEntry::builder()
-        .show_peek_icon(true)
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let totp = gtk::Entry::builder()
-        .placeholder_text("Only if two-factor is on")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let url = gtk::Entry::builder()
-        .placeholder_text("https://cloud.example.org/remote.php/dav/files/you/")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let client_id = gtk::Entry::builder()
-        .placeholder_text("Optional")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-    let client_secret = gtk::Entry::builder()
-        .placeholder_text("Optional")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
+    let name = adw::EntryRow::builder().title("Name").build();
+    let username = adw::EntryRow::builder().title("Email or username").build();
+    let password = adw::PasswordEntryRow::builder().title("Password").build();
+    let totp = adw::EntryRow::builder().title("Two-factor code").build();
+    let url = adw::EntryRow::builder().title("WebDAV address").build();
+    let client_id = adw::EntryRow::builder().title("Client ID").build();
+    let client_secret = adw::PasswordEntryRow::builder().title("Client secret").build();
 
     let group = adw::PreferencesGroup::new();
-    let provider_row = adw::ActionRow::builder().title("Provider").build();
-    provider_row.add_suffix(&provider);
-    // Not decoration: Google Drive cannot tell us which account signed in, so
-    // this is the only thing distinguishing two of them in the sidebar.
-    let name_row = adw::ActionRow::builder()
-        .title("Name")
-        .subtitle("How this account is labelled")
-        .build();
-    name_row.add_suffix(&name);
-    let username_row = adw::ActionRow::builder().title("Email or username").build();
-    username_row.add_suffix(&username);
-    let password_row = adw::ActionRow::builder().title("Password").build();
-    password_row.add_suffix(&password);
-    let totp_row = adw::ActionRow::builder().title("Two-factor code").build();
-    totp_row.add_suffix(&totp);
-    let url_row = adw::ActionRow::builder().title("WebDAV address").build();
-    url_row.add_suffix(&url);
-    // Google is retiring the client ID rclone ships, and shares its rate limit
-    // between every rclone user until then. Optional, but the row explains why
-    // somebody would want to fill it in.
-    let client_id_row = adw::ActionRow::builder()
-        .title("Client ID")
-        .subtitle("Your own OAuth app — avoids rclone's shared, rate-limited one")
-        .build();
-    client_id_row.add_suffix(&client_id);
-    let client_secret_row = adw::ActionRow::builder().title("Client secret").build();
-    client_secret_row.add_suffix(&client_secret);
     for row in [
-        &provider_row,
-        &name_row,
-        &username_row,
-        &password_row,
-        &totp_row,
-        &url_row,
-        &client_id_row,
-        &client_secret_row,
+        provider.clone().upcast::<gtk::Widget>(),
+        name.clone().upcast(),
+        username.clone().upcast(),
+        password.clone().upcast(),
+        totp.clone().upcast(),
+        url.clone().upcast(),
+        client_id.clone().upcast(),
+        client_secret.clone().upcast(),
     ] {
-        group.add(row);
+        group.add(&row);
     }
+    // Named so the visibility rules below read as rules rather than indices.
+    let (provider_row, name_row) = (provider.clone(), name.clone());
+    let (username_row, password_row) = (username.clone(), password.clone());
+    let (totp_row, url_row) = (totp.clone(), url.clone());
+    let (client_id_row, client_secret_row) = (client_id.clone(), client_secret.clone());
+    let _ = (&provider_row, &name_row);
 
     let status = gtk::Label::builder()
         .xalign(0.0)
@@ -316,33 +246,29 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
         .label("Connect")
         .css_classes(["suggested-action"])
         .build();
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .margin_top(8)
-        .build();
-    buttons.append(&cancel);
-    buttons.append(&accept);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
         .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
+        .margin_bottom(14)
+        .margin_start(14)
+        .margin_end(14)
         .build();
     body.append(&group);
     body.append(&status);
-    body.append(&buttons);
+
+    let header = adw::HeaderBar::builder().show_end_title_buttons(false).build();
+    header.set_title_widget(Some(&adw::WindowTitle::new("Add a Cloud Drive", "")));
+    header.pack_start(&cancel);
+    header.pack_end(&accept);
 
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&body));
     let dialog = adw::Dialog::builder()
         .title("Add a cloud drive")
-        .content_width(560)
+        .content_width(500)
         .child(&toolbar)
         .build();
 
@@ -395,7 +321,7 @@ pub async fn ask_cloud(parent: &impl IsA<gtk::Widget>) -> Option<NewAccount> {
     // provider, so there is nothing useful to create without a name.
     {
         let accept = accept.clone();
-        let set = move |entry: &gtk::Entry| {
+        let set = move |entry: &adw::EntryRow| {
             accept.set_sensitive(!entry.text().trim().is_empty());
         };
         set(&name);

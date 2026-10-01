@@ -2005,6 +2005,55 @@ impl Window {
         thumbs_group.add(&max_mb);
         page.add(&thumbs_group);
 
+        // ── the system file dialog ─────────────────────────────────────────
+        let portal_group = adw::PreferencesGroup::builder()
+            .title("System dialogs")
+            .description(
+                "Other applications ask the desktop for an Open or Save dialog. \
+                 Fileman can be the one they get.",
+            )
+            .build();
+
+        let portal_row = adw::ActionRow::builder()
+            .title("Use Fileman for Open and Save dialogs")
+            .subtitle(portal_subtitle())
+            .build();
+        let portal_switch = gtk::Switch::builder()
+            .valign(gtk::Align::Center)
+            .active(crate::portal::is_enabled())
+            .build();
+        portal_row.add_suffix(&portal_switch);
+        portal_row.set_activatable_widget(Some(&portal_switch));
+
+        let weak = Rc::downgrade(self);
+        let row = portal_row.clone();
+        portal_switch.connect_state_set(move |_, enabled| {
+            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            match crate::portal::set_enabled(enabled) {
+                Ok(_) => {
+                    row.set_subtitle(&portal_subtitle());
+                    // The running portal caches its configuration, so without
+                    // a restart the change appears to have done nothing.
+                    this.toast(if enabled {
+                        "Fileman will handle file dialogs — restart the portal or log in again"
+                    } else {
+                        "File dialogs handed back to the desktop's default"
+                    });
+                }
+                Err(error) => {
+                    dialogs::show_error(
+                        &this.widget(),
+                        "Could not change the file dialog",
+                        &error.to_string(),
+                    );
+                    return glib::Propagation::Stop;
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        portal_group.add(&portal_row);
+        page.add(&portal_group);
+
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
         toolbar.set_content(Some(&page));
@@ -2103,6 +2152,16 @@ impl Window {
 }
 
 // ── free functions ─────────────────────────────────────────────────────────
+
+/// Says where the file-dialog setting is written, and what it needs to apply.
+fn portal_subtitle() -> String {
+    if crate::portal::is_enabled() {
+        "Takes effect after `systemctl --user restart xdg-desktop-portal` or the next login"
+            .to_string()
+    } else {
+        "Needs the fileman-portal service, which the installer sets up".to_string()
+    }
+}
 
 /// Runs a blocking closure on a worker thread and awaits its result.
 pub(crate) async fn run_off_thread<T, F>(work: F) -> T

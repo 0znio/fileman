@@ -257,11 +257,7 @@ pub async fn ask(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
 
-    let set_default = gtk::Switch::builder()
-        .valign(gtk::Align::Center)
-        .sensitive(!mixed_types)
-        .build();
-    let default_row = adw::ActionRow::builder()
+    let set_default = adw::SwitchRow::builder()
         .title("Always open with this application")
         .subtitle(if mixed_types {
             "The selection holds more than one kind of file, so there is no single default to set"
@@ -269,11 +265,10 @@ pub async fn ask(
         } else {
             format!("Makes it the default for {kind} everywhere, not only in Fileman")
         })
+        .sensitive(!mixed_types)
         .build();
-    default_row.add_suffix(&set_default);
-    default_row.set_activatable_widget(Some(&set_default));
     let default_group = adw::PreferencesGroup::new();
-    default_group.add(&default_row);
+    default_group.add(&set_default);
 
     let cancel = gtk::Button::with_label("Cancel");
     let accept = gtk::Button::builder()
@@ -281,9 +276,6 @@ pub async fn ask(
         .css_classes(["suggested-action"])
         .sensitive(false)
         .build();
-    let buttons = gtk::Box::builder().spacing(8).halign(gtk::Align::End).build();
-    buttons.append(&cancel);
-    buttons.append(&accept);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -296,10 +288,11 @@ pub async fn ask(
     body.append(&search);
     body.append(&scroller);
     body.append(&default_group);
-    body.append(&buttons);
 
-    let header = adw::HeaderBar::new();
+    let header = adw::HeaderBar::builder().show_end_title_buttons(false).build();
     header.set_title_widget(Some(&adw::WindowTitle::new("Open With", &subtitle)));
+    header.pack_start(&cancel);
+    header.pack_end(&accept);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&body));

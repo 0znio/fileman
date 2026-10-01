@@ -33,6 +33,10 @@ The installer also pulls the optional pieces each feature needs: `gvfs` and
 for NTFS repair, and `pigz` for fast `.tar.gz`. Everything else still works
 without them, and the app says which one is missing rather than failing quietly.
 
+At the end it asks whether Fileman should be the Open/Save dialog other
+applications use — see [below](#be-the-systems-file-dialog). Answer `n` and
+nothing changes.
+
 Options go after `-s --`, since the script is piped into `sh`:
 
 ```sh
@@ -44,6 +48,7 @@ curl -fsSL .../install.sh | sh -s -- --from-source --prefix /usr/local
 | `--from-source` | Build with cargo instead of downloading |
 | `--prefix DIR` | Install under `DIR` (default `/usr/local`, or `~/.local` without root) |
 | `--version TAG` | A specific release |
+| `--portal` / `--no-portal` | Answer the file-dialog question without being asked |
 | `--no-deps` | Leave the package manager alone |
 | `--uninstall` | Remove it again |
 
@@ -175,6 +180,36 @@ stutter. Settings → Performance overrides it.
 
 </details>
 
+## Be the system's file dialog
+
+When Firefox asks where to save a download, or a chat app asks which photo to
+attach, the desktop hands that request to a *portal backend*. Fileman can be
+that backend — with your places, your sorting, your thumbnails.
+
+```sh
+fileman-portal --enable     # use Fileman for Open and Save dialogs
+fileman-portal --disable    # hand them back to the desktop's default
+fileman-portal --status     # show which backend is in use
+```
+
+There is a switch for the same thing in **Preferences → System dialogs**.
+
+Either way, the portal caches its configuration, so the change applies after:
+
+```sh
+systemctl --user restart xdg-desktop-portal
+```
+
+It writes one line to `~/.config/xdg-desktop-portal/portals.conf`, which every
+`xdg-desktop-portal` from 1.18 reads ahead of whatever your distribution
+shipped — so this works the same on Arch, Fedora, Debian and the rest, needs no
+root, and touches nothing in `/usr`. Disabling removes that line and your
+previous backend takes over again.
+
+The daemon that waits for those requests links no toolkit at all: it sits at
+about **4 MB** against 26 MB for `xdg-desktop-portal-gtk`, and starts Fileman
+only while a dialog is actually open.
+
 ## Shortcuts
 
 `Ctrl+?` lists them all in the app.
@@ -253,8 +288,9 @@ widget.
 No split view · each network protocol needs its own gvfs backend installed, and
 the connect dialog says which · video plays in the preview only when GStreamer
 has the codec (`gst-plugins-good`, `gst-libav`), otherwise it shows a still frame
-· not yet a desktop file-chooser backend, so browsers still use the GTK save
-dialog.
+· the file-dialog backend needs `xdg-desktop-portal` 1.18 or newer, and a
+portal restart (or re-login) after switching · the downloader has no queue or
+resume yet.
 
 ## Licence
 

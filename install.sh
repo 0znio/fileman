@@ -50,6 +50,8 @@ Usage: install.sh [options]
   --prefix DIR      Install under DIR (default: /usr/local as root, else ~/.local)
   --version TAG     Install a specific release tag (default: latest)
   --no-deps         Don't touch the package manager
+  --portal          Make Fileman the Open/Save dialog for other apps
+  --no-portal       Leave the file dialog alone (don't ask)
   --yes, -y         Don't prompt
   --uninstall       Remove an existing install
   --help, -h        This
@@ -58,6 +60,9 @@ USAGE
 
 # ── arguments ───────────────────────────────────────────────────────────────
 UNINSTALL="no"
+PORTAL_INSTALLED="no"
+# "ask" unless --portal or --no-portal settles it up front.
+PORTAL_CHOICE="ask"
 while [ $# -gt 0 ]; do
     case "$1" in
         --from-source) MODE="source" ;;
@@ -67,6 +72,8 @@ while [ $# -gt 0 ]; do
         --version)     VERSION="${2:?--version needs a tag}"; shift ;;
         --version=*)   VERSION="${1#*=}" ;;
         --no-deps)     INSTALL_DEPS="no" ;;
+        --portal)      PORTAL_CHOICE="yes" ;;
+        --no-portal)   PORTAL_CHOICE="no" ;;
         -y|--yes)      ASSUME_YES="yes" ;;
         --uninstall)   UNINSTALL="yes" ;;
         -h|--help)     usage; exit 0 ;;
@@ -152,11 +159,146 @@ BINDIR="$PREFIX/bin"
 APPDIR="$PREFIX/share/applications"
 ICONDIR="$PREFIX/share/icons/hicolor"
 ICON_SIZES="16 24 32 48 64 128 256 512"
+# The portal backend. Started by xdg-desktop-portal rather than by a person,
+# so the daemon lives in libexec, with a symlink on PATH because
+# `fileman-portal --enable` is something a person does run by name.
+PORTAL_BIN="fileman-portal"
+LIBEXECDIR="$PREFIX/libexec"
+PORTALDIR="$PREFIX/share/xdg-desktop-portal/portals"
+DBUSDIR="$PREFIX/share/dbus-1/services"
+PORTAL_SERVICE="org.freedesktop.impl.portal.desktop.fileman.service"
+
+# ── the portal backend ──────────────────────────────────────────────────────
+# The user's home, even when the script is running under sudo: the portal
+# preference lives in their config, not root's.
+portal_home() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6
+    else
+        echo "${HOME:-}"
+    fi
+}
+
+# Takes Fileman out of the user's portals.conf, as their own user.
+disable_portal_config() {
+    home=$(portal_home)
+    [ -n "$home" ] || return 0
+    conf="$home/.config/xdg-desktop-portal/portals.conf"
+    [ -f "$conf" ] || return 0
+    grep -q "FileChooser=fileman" "$conf" 2>/dev/null || return 0
+
+    if [ -n "${SUDO_USER:-}" ]; then
+        # As them, so the file does not end up owned by root.
+        sudo -u "$SUDO_USER" sed -i '/FileChooser=fileman/d' "$conf" 2>/dev/null || {
+            warn "could not edit $conf — run: fileman-portal --disable"
+            return 0
+        }
+    else
+        sed -i '/FileChooser=fileman/d' "$conf" 2>/dev/null || {
+            warn "could not edit $conf — run: fileman-portal --disable"
+            return 0
+        }
+    fi
+    say "file dialogs handed back to the desktop's default"
+}
+
+# Turns Fileman on as the file chooser, as the invoking user: the preference
+# lives in their config, not root's, even when the install needed sudo.
+enable_portal_config() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" "$BINDIR/$PORTAL_BIN" --enable >/dev/null 2>&1
+    else
+        "$BINDIR/$PORTAL_BIN" --enable >/dev/null 2>&1
+    fi || { warn "could not enable it — run: $PORTAL_BIN --enable"; return 1; }
+
+    # The running portal caches its configuration, so without a restart the
+    # change appears to have done nothing at all.
+    if [ -n "${SUDO_USER:-}" ]; then
+        uid=$(id -u "$SUDO_USER" 2>/dev/null)
+        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user restart xdg-desktop-portal >/dev/null 2>&1 || true
+    else
+        systemctl --user restart xdg-desktop-portal >/dev/null 2>&1 || true
+    fi
+    ok "Fileman is now the Open/Save dialog for other applications"
+    say "  turn it off any time with: $PORTAL_BIN --disable"
+    return 0
+}
+
+# Asks, once, at the end of a successful install.
+offer_portal() {
+    [ "$PORTAL_INSTALLED" = "yes" ] || return 0
+    case "$PORTAL_CHOICE" in
+        no)  return 0 ;;
+        yes) enable_portal_config; return 0 ;;
+    esac
+
+    # `curl | sh` leaves stdin pointing at the script itself, so the prompt has
+    # to be read from the terminal instead. Whether there is one is settled by
+    # *opening* it: a test like `[ -r /dev/tty ]` says yes in environments
+    # where the open then fails, which printed a shell error at the user.
+    reply=""
+    # Probed in a subshell on purpose. A failed redirection on `exec` makes a
+    # non-interactive shell exit outright, so testing the terminal this way in
+    # the main shell would end the install silently at its very last step —
+    # which is exactly what it did before this comment existed.
+    if ( exec 3< /dev/tty ) 2>/dev/null; then
+        ask_portal
+        # A failed redirection on a simple command is not fatal, unlike `exec`.
+        read -r reply < /dev/tty || reply=""
+    elif [ -t 0 ]; then
+        ask_portal
+        read -r reply || reply=""
+    else
+        # No terminal at all — a CI run or a Dockerfile. Asking would hang.
+        say "To make Fileman the Open/Save dialog for other apps: $PORTAL_BIN --enable"
+        return 0
+    fi
+
+    case "$reply" in
+        [Yy]*) enable_portal_config ;;
+        *)     say "Left alone. Enable it later with: $PORTAL_BIN --enable" ;;
+    esac
+}
+
+ask_portal() {
+    printf '\n%s\n' "Fileman can also be the Open/Save dialog other applications use."
+    printf '%s' "Enable that now? [y/N] "
+}
+
+# place_portal <daemon> <portal-file> <service-file>
+#
+# Each piece is optional: a tarball from before the portal existed simply has
+# none of them, and the rest of the install must still succeed.
+place_portal() {
+    [ -f "$1" ] || { warn "no portal backend in this build — skipping"; return 0; }
+    maybe_root install -Dm755 "$1" "$LIBEXECDIR/$PORTAL_BIN"
+    maybe_root install -d "$BINDIR"
+    maybe_root ln -sf "$LIBEXECDIR/$PORTAL_BIN" "$BINDIR/$PORTAL_BIN"
+
+    [ -f "$2" ] && maybe_root install -Dm644 "$2" "$PORTALDIR/fileman.portal"
+
+    # The service file names the daemon by absolute path, which is only known
+    # once the prefix is.
+    if [ -f "$3" ]; then
+        ensure_scratch
+        sed -e "s|@LIBEXECDIR@|$LIBEXECDIR|" "$3" > "$WORK/$PORTAL_SERVICE"
+        maybe_root install -Dm644 "$WORK/$PORTAL_SERVICE" "$DBUSDIR/$PORTAL_SERVICE"
+    fi
+    PORTAL_INSTALLED="yes"
+}
 
 # ── uninstall ───────────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = "yes" ]; then
     say "Removing $APP from $PREFIX"
+    # Before anything is removed: if Fileman is the configured file chooser,
+    # take that line out. A portals.conf pointing at a backend that no longer
+    # exists does not fall back — it leaves every Open and Save dialog on the
+    # system broken, which is a terrible parting gift from an uninstaller.
+    disable_portal_config
     maybe_root rm -f "$PREFIX/bin/$APP" "$PREFIX/share/applications/$DESKTOP"
+    maybe_root rm -f "$BINDIR/$PORTAL_BIN" "$LIBEXECDIR/$PORTAL_BIN"
+    maybe_root rm -f "$PORTALDIR/fileman.portal" "$DBUSDIR/$PORTAL_SERVICE"
     for size in $ICON_SIZES; do
         maybe_root rm -f "$ICONDIR/${size}x${size}/apps/$APP_ICON.png"
     done
@@ -464,6 +606,9 @@ install_binary() {
         return 1
     fi
     place "$dir/$APP" "$dir/share/applications/$DESKTOP" "$dir/share/icons"
+    place_portal "$dir/$PORTAL_BIN" \
+        "$dir/share/xdg-desktop-portal/portals/fileman.portal" \
+        "$dir/share/dbus-1/services/$PORTAL_SERVICE"
 }
 
 install_source() {
@@ -488,8 +633,11 @@ install_source() {
         src="$tmp/src"
     fi
 
-    ( cd "$src" && cargo build --release --locked ) || die "build failed"
+    ( cd "$src" && cargo build --release --locked --bins ) || die "build failed"
     place "$src/target/release/$APP" "$src/data/$DESKTOP" "$src/data/icons"
+    place_portal "$src/target/release/$PORTAL_BIN" \
+        "$src/data/portal/fileman.portal" \
+        "$src/data/portal/org.freedesktop.impl.portal.desktop.fileman.service"
 }
 
 # ── go ──────────────────────────────────────────────────────────────────────
@@ -533,5 +681,9 @@ have fusermount3 || have fusermount || \
     warn "fuse3 not installed — cloud drives cannot be mounted"
 [ -f /usr/share/gvfs/mounts/smb.mount ] || \
     warn "gvfs-smb not installed — Windows network shares will be unavailable"
+
+# Asked last, once everything else has succeeded — and after the dependency
+# warnings, so the question is the final thing on screen rather than buried.
+offer_portal
 
 printf '\n  Run it with: %sfileman%s [path]\n\n' "$B" "$R"

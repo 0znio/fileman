@@ -17,52 +17,53 @@ use crate::fs::batch_rename::{self, CaseMode, Planned, Rule, Status};
 const PREVIEW_ROWS: usize = 200;
 
 pub async fn ask(parent: &impl IsA<gtk::Widget>, files: Vec<(PathBuf, bool)>) -> Option<Vec<Planned>> {
-    let mode = gtk::DropDown::from_strings(&["Find and replace", "Number them", "Change case"]);
-    mode.set_valign(gtk::Align::Center);
+    let mode = adw::ComboRow::builder()
+        .title("Rename by")
+        .model(&gtk::StringList::new(&["Find and replace", "Number them", "Change case"]))
+        .build();
 
-    let find = gtk::Entry::builder().placeholder_text("Text to find").hexpand(true).build();
-    let with = gtk::Entry::builder().placeholder_text("Replace with").hexpand(true).build();
-    let match_case = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    let find = adw::EntryRow::builder().title("Find").build();
+    let with = adw::EntryRow::builder().title("Replace with").build();
+    let match_case = adw::SwitchRow::builder().title("Match case").build();
 
-    let pattern = gtk::Entry::builder()
+    let pattern = adw::EntryRow::builder()
+        .title("Pattern")
         .text("File {n}")
         .tooltip_text("{n} is the number, {name} is the current name")
-        .hexpand(true)
         .build();
-    let start = gtk::SpinButton::with_range(0.0, 1_000_000.0, 1.0);
+    let start = adw::SpinRow::with_range(0.0, 1_000_000.0, 1.0);
+    start.set_title("Start at");
     start.set_value(1.0);
-    start.set_valign(gtk::Align::Center);
-    let pad = gtk::SpinButton::with_range(0.0, 8.0, 1.0);
+    let pad = adw::SpinRow::with_range(0.0, 8.0, 1.0);
+    pad.set_title("Digits");
+    pad.set_subtitle("Zero-padded so the names sort in order");
     // Enough digits that the names sort in order in any file manager.
     pad.set_value(files.len().to_string().len().max(2) as f64);
-    pad.set_valign(gtk::Align::Center);
 
-    let case = gtk::DropDown::from_strings(&["lowercase", "UPPERCASE", "Title Case"]);
-    case.set_valign(gtk::Align::Center);
+    let case = adw::ComboRow::builder()
+        .title("Case")
+        .model(&gtk::StringList::new(&["lowercase", "UPPERCASE", "Title Case"]))
+        .build();
 
-    let keep_ext = gtk::Switch::builder().active(true).valign(gtk::Align::Center).build();
-
-    let row = |title: &str, subtitle: Option<&str>, widget: &gtk::Widget| {
-        let row = adw::ActionRow::builder().title(title).build();
-        if let Some(subtitle) = subtitle {
-            row.set_subtitle(subtitle);
-        }
-        row.add_suffix(widget);
-        row
-    };
-    let mode_row = row("Rename by", None, mode.upcast_ref());
-    let find_row = row("Find", None, find.upcast_ref());
-    let with_row = row("Replace with", None, with.upcast_ref());
-    let case_match_row = row("Match case", None, match_case.upcast_ref());
-    let pattern_row = row("Pattern", Some("{n} for the number, {name} for the current name"), pattern.upcast_ref());
-    let start_row = row("Start at", None, start.upcast_ref());
-    let pad_row = row("Digits", Some("Zero-padded so the names sort in order"), pad.upcast_ref());
-    let case_row = row("Case", None, case.upcast_ref());
-    let ext_row = row("Keep extensions", Some("Leave .jpg, .tar.gz and so on as they are"), keep_ext.upcast_ref());
+    let keep_ext = adw::SwitchRow::builder()
+        .title("Keep extensions")
+        .subtitle("Leave .jpg, .tar.gz and so on as they are")
+        .active(true)
+        .build();
 
     let group = adw::PreferencesGroup::new();
-    for r in [&mode_row, &find_row, &with_row, &case_match_row, &pattern_row, &start_row, &pad_row, &case_row, &ext_row] {
-        group.add(r);
+    for row in [
+        mode.clone().upcast::<gtk::Widget>(),
+        find.clone().upcast(),
+        with.clone().upcast(),
+        match_case.clone().upcast(),
+        pattern.clone().upcast(),
+        start.clone().upcast(),
+        pad.clone().upcast(),
+        case.clone().upcast(),
+        keep_ext.clone().upcast(),
+    ] {
+        group.add(&row);
     }
 
     let preview = gtk::ListBox::builder()
@@ -129,14 +130,14 @@ pub async fn ask(parent: &impl IsA<gtk::Widget>, files: Vec<(PathBuf, bool)>) ->
             case.clone(),
             keep_ext.clone(),
         );
-        let rows = [
-            (find_row.clone(), 0u32),
-            (with_row.clone(), 0),
-            (case_match_row.clone(), 0),
-            (pattern_row.clone(), 1),
-            (start_row.clone(), 1),
-            (pad_row.clone(), 1),
-            (case_row.clone(), 2),
+        let rows: [(gtk::Widget, u32); 7] = [
+            (find.clone().upcast(), 0),
+            (with.clone().upcast(), 0),
+            (match_case.clone().upcast(), 0),
+            (pattern.clone().upcast(), 1),
+            (start.clone().upcast(), 1),
+            (pad.clone().upcast(), 1),
+            (case.clone().upcast(), 2),
         ];
         let (preview, summary, accept) = (preview.clone(), summary.clone(), accept.clone());
         let current = Rc::clone(&current);
@@ -212,11 +213,11 @@ pub async fn ask(parent: &impl IsA<gtk::Widget>, files: Vec<(PathBuf, bool)>) ->
     }
     for spin in [&start, &pad] {
         let refresh = Rc::clone(&refresh);
-        spin.connect_value_changed(move |_| refresh());
+        spin.connect_value_notify(move |_| refresh());
     }
-    for drop in [&mode, &case] {
+    for combo in [&mode, &case] {
         let refresh = Rc::clone(&refresh);
-        drop.connect_selected_notify(move |_| refresh());
+        combo.connect_selected_notify(move |_| refresh());
     }
     refresh();
 

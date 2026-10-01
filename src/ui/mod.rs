@@ -1,6 +1,7 @@
 pub mod accent;
 pub mod actions;
 pub mod batch_rename;
+pub mod chooser;
 pub mod connect;
 pub mod dialogs;
 pub mod file_object;

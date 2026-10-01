@@ -458,94 +458,86 @@ pub async fn ask_download(
     parent: &impl IsA<gtk::Widget>,
     start_dir: &Path,
 ) -> Option<(crate::fs::download::Probe, PathBuf)> {
-    let url = gtk::Entry::builder()
-        .placeholder_text("https://example.com/file.zip")
-        .activates_default(true)
-        .hexpand(true)
-        .build();
-
-    let name = gtk::Entry::builder()
-        .placeholder_text("Saved as…")
-        .activates_default(true)
-        .hexpand(true)
-        .sensitive(false)
-        .build();
+    // Rows that carry their own labels, rather than a label with an entry
+    // squeezed into its suffix — which is what made this dialog look like a
+    // settings panel from two decades ago.
+    let url = adw::EntryRow::builder().title("Address").build();
+    let name = adw::EntryRow::builder().title("Save as").sensitive(false).build();
 
     let folder = Rc::new(RefCell::new(start_dir.to_path_buf()));
-    let folder_button = gtk::Button::builder()
-        .child(&folder_button_content(start_dir))
-        .tooltip_text("Choose a different folder")
-        .hexpand(true)
-        .halign(gtk::Align::Fill)
+    let folder_row = adw::ActionRow::builder()
+        .title("Save into")
+        .subtitle(folder_label(start_dir))
+        .activatable(true)
         .build();
+    folder_row.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
+    folder_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+
+    let group = adw::PreferencesGroup::new();
+    group.add(&url);
+    group.add(&name);
+    group.add(&folder_row);
 
     let status = gtk::Label::builder()
         .label("Paste a link to check it")
         .xalign(0.0)
         .wrap(true)
-        .max_width_chars(52)
+        // A URL has no spaces, so word wrapping cannot break one: the label
+        // simply grew, and took the whole dialog with it until it ran off the
+        // screen. Breaking mid-word keeps the dialog the size it was built as.
+        .wrap_mode(pango::WrapMode::WordChar)
+        .max_width_chars(44)
+        .lines(3)
+        .ellipsize(pango::EllipsizeMode::End)
+        .margin_start(4)
         .css_classes(["caption", "dim-label"])
         .build();
 
-    let group = adw::PreferencesGroup::new();
-    let url_row = adw::ActionRow::builder().title("Address").build();
-    url_row.add_suffix(&url);
-    let name_row = adw::ActionRow::builder().title("Save as").build();
-    name_row.add_suffix(&name);
-    let folder_row = adw::ActionRow::builder().title("Into").build();
-    folder_row.add_suffix(&folder_button);
-    group.add(&url_row);
-    group.add(&name_row);
-    group.add(&folder_row);
-
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .margin_top(8)
-        .build();
+    // The actions live in the header bar, where every modern GNOME dialog
+    // puts them, instead of a row of buttons stuck under the content.
     let cancel = gtk::Button::with_label("Cancel");
     let accept = gtk::Button::builder()
         .label("Download")
         .css_classes(["suggested-action"])
         .sensitive(false)
         .build();
-    buttons.append(&cancel);
-    buttons.append(&accept);
+    let header = adw::HeaderBar::builder().show_end_title_buttons(false).build();
+    header.set_title_widget(Some(&adw::WindowTitle::new("Download", "")));
+    header.pack_start(&cancel);
+    header.pack_end(&accept);
 
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
         .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
+        .margin_bottom(14)
+        .margin_start(14)
+        .margin_end(14)
         .build();
     body.append(&group);
     body.append(&status);
-    body.append(&buttons);
 
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&body));
 
     let dialog = adw::Dialog::builder()
         .title("Download a file")
-        .content_width(560)
+        .content_width(500)
         .child(&toolbar)
         .build();
 
     let probed: Rc<RefCell<Option<crate::fs::download::Probe>>> = Rc::new(RefCell::new(None));
     let generation = Rc::new(std::cell::Cell::new(0u64));
 
-    // Folder picker.
+    // Folder picker: the whole row is the target, so there is no small button
+    // to aim at.
     {
         let folder = Rc::clone(&folder);
         let dialog = dialog.clone();
-        let folder_button2 = folder_button.clone();
-        folder_button.connect_clicked(move |_| {
-            let (folder, dialog, button) =
-                (Rc::clone(&folder), dialog.clone(), folder_button2.clone());
+        let row = folder_row.clone();
+        folder_row.connect_activated(move |_| {
+            let (folder, dialog, row) = (Rc::clone(&folder), dialog.clone(), row.clone());
             glib::spawn_future_local(async move {
                 let chooser = gtk::FileDialog::builder().title("Download into").build();
                 let current = gio::File::for_path(folder.borrow().clone());
@@ -554,7 +546,7 @@ pub async fn ask_download(
                 if let Ok(picked) = chooser.select_folder_future(root.as_ref()).await
                     && let Some(path) = picked.path()
                 {
-                    button.set_child(Some(&folder_button_content(&path)));
+                    row.set_subtitle(&folder_label(&path));
                     *folder.borrow_mut() = path;
                 }
             });
@@ -659,23 +651,36 @@ pub async fn ask_download(
 
 /// Folder name over its path, so the button says both where it is going and
 /// exactly where that is.
-fn folder_button_content(path: &Path) -> gtk::Box {
-    let boxed = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    boxed.append(&gtk::Label::builder().label(&name).xalign(1.0).build());
-    boxed.append(
-        &gtk::Label::builder()
-            .label(path.to_string_lossy())
-            .xalign(1.0)
-            .ellipsize(pango::EllipsizeMode::Start)
-            .max_width_chars(34)
-            .css_classes(["caption", "dim-label"])
-            .build(),
-    );
-    boxed
+/// The folder a download will land in, written the way a person refers to it:
+/// `Downloads` rather than `/home/ana/Downloads`, and `~/code/fileman` when
+/// the name alone would be ambiguous.
+fn folder_label(path: &Path) -> String {
+    let full = path.to_string_lossy().into_owned();
+    match dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~/{}", relative.display()),
+        None => full,
+    }
+}
+
+/// A URL short enough to read: the host, and the end of the path.
+///
+/// Resolved download links run to hundreds of characters of signed query
+/// string, none of which tells the user anything. What they need to see is
+/// which host it now points at.
+fn short_url(url: &str) -> String {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let (host, path) = match without_scheme.split_once('/') {
+        Some((host, path)) => (host, path),
+        None => return without_scheme.to_string(),
+    };
+    let tail = path.split(['?', '#']).next().unwrap_or("");
+    let tail = tail.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
+    if tail.is_empty() {
+        return host.to_string();
+    }
+    let tail: String = tail.chars().take(40).collect();
+    format!("{host}/…/{tail}")
 }
 
 fn describe(probe: &crate::fs::download::Probe) -> String {
@@ -696,7 +701,7 @@ fn describe(probe: &crate::fs::download::Probe) -> String {
     // address that will actually be fetched is often not the one that was
     // pasted. Showing it makes a wrong guess correctable instead of mysterious.
     if probe.was_redirected() {
-        format!("{transfer}\nFetching from {}", probe.url)
+        format!("{transfer}\nFetching from {}", short_url(&probe.url))
     } else {
         transfer
     }
@@ -806,3 +811,28 @@ pub fn show_job_errors(
 }
 
 use chrono::TimeZone;
+
+#[cfg(test)]
+mod url_tests {
+    use super::short_url;
+
+    /// Resolved download links run to hundreds of characters of signed query
+    /// string. The dialog has to stay readable, and the host is the part that
+    /// tells the user where the file is really coming from.
+    #[test]
+    fn a_long_url_is_shortened_to_host_and_name() {
+        let long = "https://store-eu-par-1.gofile.io/download/web/0d9f/holiday-photos.zip\
+                    ?token=abcdefghijklmnopqrstuvwxyz0123456789&expires=1790000000&signature=deadbeef";
+        let short = short_url(long);
+        assert!(short.starts_with("store-eu-par-1.gofile.io/"), "{short}");
+        assert!(short.contains("holiday-photos.zip"), "{short}");
+        assert!(short.len() < 70, "still {} characters: {short}", short.len());
+    }
+
+    #[test]
+    fn short_addresses_are_left_recognisable() {
+        assert_eq!(short_url("https://example.com"), "example.com");
+        assert_eq!(short_url("https://example.com/"), "example.com");
+        assert_eq!(short_url("https://example.com/a/b/file.iso"), "example.com/…/file.iso");
+    }
+}

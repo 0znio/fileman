@@ -1,0 +1,6 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.fileman
+Interfaces=org.freedesktop.impl.portal.FileChooser;
+# Deliberately every desktop: this backend is chosen per user through
+# portals.conf, not by guessing which desktop the user happens to run.
+UseIn=*

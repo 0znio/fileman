@@ -31,7 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --locked
+        # Both binaries: the application and the portal backend.
+        run: cargo build --release --locked --bins
 
       - name: Test
         run: cargo test --release --locked
@@ -59,9 +60,17 @@ jobs:
           DIR="fileman-${VERSION}-x86_64-linux"
           mkdir -p "dist/$DIR"
           cp target/release/fileman "dist/$DIR/"
+          # The portal backend: the daemon that lets other applications open
+          # their file dialogs in Fileman. Shipped alongside, since the
+          # installer cannot set it up if the tarball does not contain it.
+          cp target/release/fileman-portal "dist/$DIR/"
           cp README.md LICENSE "dist/$DIR/"
           mkdir -p "dist/$DIR/share/applications"
           cp data/dev.fileman.Files.desktop "dist/$DIR/share/applications/"
+          mkdir -p "dist/$DIR/share/xdg-desktop-portal/portals" "dist/$DIR/share/dbus-1/services"
+          cp data/portal/fileman.portal "dist/$DIR/share/xdg-desktop-portal/portals/"
+          cp data/portal/org.freedesktop.impl.portal.desktop.fileman.service \
+            "dist/$DIR/share/dbus-1/services/"
           cp -r data/icons "dist/$DIR/share/"
           printf 'glibc>=%s\ngtk4>=4.12\nlibadwaita>=1.5\n' \
             "${{ steps.reqs.outputs.glibc }}" > "dist/$DIR/REQUIREMENTS"

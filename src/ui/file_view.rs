@@ -352,6 +352,17 @@ impl FileView {
         self.filter.changed(gtk::FilterChange::Different);
     }
 
+    /// Drops the columns a narrow window has no room for.
+    ///
+    /// Size, Modified and Type are fixed width and together take 440px. In a
+    /// file dialog that leaves the name — the one column anybody is reading —
+    /// squeezed to a width that shows `Bas…html`, which is of no use to
+    /// anyone. Type goes first, and Modified narrows.
+    pub fn set_compact_columns(&self, compact: bool) {
+        self.kind_column.set_visible(!compact);
+        self.modified_column.set_fixed_width(if compact { 130 } else { 170 });
+    }
+
     /// Re-runs both factories so a new icon size takes effect immediately.
     pub fn refresh_items(&self) {
         let mode = self.config.borrow().view_mode;

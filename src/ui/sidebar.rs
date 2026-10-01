@@ -67,6 +67,10 @@ pub struct Sidebar {
     /// stored, so a remote added outside Fileman still shows up.
     cloud: RefCell<Vec<crate::fs::cloud::Account>>,
     trash_count: RefCell<usize>,
+    /// Trimmed for the file-chooser dialog, where Trash and Recent are not
+    /// places to save into and the "add a connection" rows lead to dialogs
+    /// that only the main window has.
+    chooser_mode: std::cell::Cell<bool>,
 
     on_navigate: Callback<PathBuf>,
     on_open_trash: RefCell<Option<Rc<dyn Fn()>>>,
@@ -112,6 +116,7 @@ impl Sidebar {
             servers: RefCell::new(Vec::new()),
             cloud: RefCell::new(Vec::new()),
             trash_count: RefCell::new(0),
+            chooser_mode: std::cell::Cell::new(false),
             on_navigate: RefCell::new(None),
             on_open_trash: RefCell::new(None),
             on_open_recent: RefCell::new(None),
@@ -186,6 +191,12 @@ impl Sidebar {
     }
     pub fn connect_drop(&self, f: impl Fn((Vec<PathBuf>, PathBuf)) + 'static) {
         *self.on_drop.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Trims the sidebar to what a file dialog can act on.
+    pub fn set_chooser_mode(self: &Rc<Self>, on: bool) {
+        self.chooser_mode.set(on);
+        self.rebuild();
     }
 
     pub fn set_volumes(self: &Rc<Self>, volumes: Vec<Volume>) {
@@ -292,18 +303,23 @@ impl Sidebar {
     fn build_system(self: &Rc<Self>) {
         let list = self.new_section(Some("System"));
 
-        let recent = self.make_row(
-            "Recent",
-            "document-open-recent-symbolic",
-            None,
-            Target::Recent,
-        );
-        list.append(&recent);
+        // A dialog saving a file has no use for the Trash, and "Recent" is a
+        // view rather than a folder it could write into.
+        if !self.chooser_mode.get() {
+            let recent = self.make_row(
+                "Recent",
+                "document-open-recent-symbolic",
+                None,
+                Target::Recent,
+            );
+            list.append(&recent);
 
-        let count = *self.trash_count.borrow();
-        let badge = (count > 0).then(|| count.to_string());
-        let trash = self.make_row("Trash", "user-trash-symbolic", badge.as_deref(), Target::Trash);
-        list.append(&trash);
+            let count = *self.trash_count.borrow();
+            let badge = (count > 0).then(|| count.to_string());
+            let trash =
+                self.make_row("Trash", "user-trash-symbolic", badge.as_deref(), Target::Trash);
+            list.append(&trash);
+        }
 
         let computer = self.make_row(
             "Other Locations",
@@ -370,9 +386,14 @@ impl Sidebar {
     /// "my NAS" is one thing whose state changes, and splitting it means the
     /// same share appears twice as soon as it is connected.
     fn build_network(self: &Rc<Self>) {
-        let list = self.new_section(Some("Network"));
         let mounted = crate::fs::remote::mounted();
         let servers = self.servers.borrow().clone();
+        // In a dialog there is no "Connect to Server" row to anchor it, so an
+        // empty Network section would be a heading with nothing underneath.
+        if self.chooser_mode.get() && mounted.is_empty() && servers.is_empty() {
+            return;
+        }
+        let list = self.new_section(Some("Network"));
 
         for server in &servers {
             let uri = server.uri();
@@ -412,9 +433,12 @@ impl Sidebar {
             list.append(&row);
         }
 
-        let connect = self.make_row("Connect to Server…", "list-add-symbolic", None, Target::ConnectServer);
-        connect.set_tooltip_text(Some("SMB, SFTP, FTP, WebDAV or NFS"));
-        list.append(&connect);
+        if !self.chooser_mode.get() {
+            let connect =
+                self.make_row("Connect to Server…", "list-add-symbolic", None, Target::ConnectServer);
+            connect.set_tooltip_text(Some("SMB, SFTP, FTP, WebDAV or NFS"));
+            list.append(&connect);
+        }
     }
 
     /// Cloud accounts, one row each, named by who they signed in as.
@@ -424,6 +448,9 @@ impl Sidebar {
     /// mistake that is noticed much later.
     fn build_cloud(self: &Rc<Self>) {
         let accounts = self.cloud.borrow().clone();
+        if accounts.is_empty() && self.chooser_mode.get() {
+            return;
+        }
         if accounts.is_empty() && !crate::fs::cloud::is_available() {
             // Nothing configured and no rclone: one row that explains itself
             // beats an empty section.
@@ -451,9 +478,11 @@ impl Sidebar {
             list.append(&row);
         }
 
-        let add = self.make_row("Add Cloud Drive…", "list-add-symbolic", None, Target::AddCloud);
-        add.set_tooltip_text(Some("Google Drive, Proton Drive, Icedrive and others"));
-        list.append(&add);
+        if !self.chooser_mode.get() {
+            let add = self.make_row("Add Cloud Drive…", "list-add-symbolic", None, Target::AddCloud);
+            add.set_tooltip_text(Some("Google Drive, Proton Drive, Icedrive and others"));
+            list.append(&add);
+        }
     }
 
     /// Right-click on a saved server: edit or forget it.

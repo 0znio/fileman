@@ -49,8 +49,16 @@ pub fn run_portal_dialog() -> glib::ExitCode {
         .build();
 
     let answer: Rc<RefCell<Response>> = Rc::new(RefCell::new(Response::default()));
+    // The dialog has to outlive the callback that builds it. GTK owns the
+    // widgets, so the window stays on screen either way — but every handler
+    // holds a weak reference back to this struct, and once it is dropped they
+    // all quietly do nothing: the sidebar stops navigating, Save stops saving,
+    // and the listing never arrives because the scan's callback returns early.
+    // It looks like a dialog that merely does not work.
+    let held: Rc<RefCell<Option<Rc<Chooser>>>> = Rc::new(RefCell::new(None));
     {
         let (request, answer) = (request.clone(), Rc::clone(&answer));
+        let held = Rc::clone(&held);
         app.connect_command_line(move |app, _| {
             // The accent colour and spacing the user picked, so the dialog
             // matches the rest of Fileman rather than looking borrowed.
@@ -58,6 +66,7 @@ pub fn run_portal_dialog() -> glib::ExitCode {
             crate::app::load_stylesheet(&accent);
             let chooser = Chooser::new(app, request.clone(), Rc::clone(&answer));
             chooser.present();
+            *held.borrow_mut() = Some(chooser);
             glib::ExitCode::SUCCESS
         });
     }
@@ -82,6 +91,7 @@ struct Chooser {
     name: gtk::Entry,
     accept: gtk::Button,
     filters: gtk::DropDown,
+    sidebar: Rc<crate::ui::sidebar::Sidebar>,
     config: Rc<RefCell<Config>>,
     current: RefCell<PathBuf>,
     generation: Cell<u64>,
@@ -94,6 +104,9 @@ impl Chooser {
         config.borrow_mut().view_mode = ViewMode::List;
 
         let view = FileView::new(Rc::clone(&config));
+        // The dialog is far narrower than the main window, and the fixed-width
+        // columns would leave nothing for the file names.
+        view.set_compact_columns(true);
         let pathbar = PathBar::new();
 
         let accept_label = request.accept_label.clone().unwrap_or_else(|| {
@@ -118,55 +131,32 @@ impl Chooser {
         } else {
             request.title.clone()
         };
+        let hidden = gtk::ToggleButton::builder()
+            .icon_name("view-conceal-symbolic")
+            .tooltip_text("Show hidden files (Ctrl+H)")
+            .active(config.borrow().show_hidden)
+            .build();
+        let view_mode = gtk::Button::builder()
+            .icon_name("view-grid-symbolic")
+            .tooltip_text("Switch between list and grid (Ctrl+Shift+V)")
+            .build();
+
         let header = adw::HeaderBar::builder().show_end_title_buttons(false).build();
         header.set_title_widget(Some(&adw::WindowTitle::new(&title, &asking(&request))));
         header.pack_start(&cancel);
+        header.pack_start(&hidden);
+        header.pack_start(&view_mode);
         header.pack_end(&accept);
 
-        // Places. Built here rather than reusing the main sidebar, which would
-        // query UDisks2 and rclone just to draw a dialog — but it still has to
-        // show the drives and shares the user actually keeps things on, or the
-        // dialog cannot reach half their files.
-        let shortcuts = places();
-        let places = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::Single)
-            .css_classes(["navigation-sidebar"])
-            .build();
-        for place in &shortcuts {
-            let row = adw::ActionRow::builder().title(&place.label).activatable(true).build();
-            row.add_prefix(&gtk::Image::from_icon_name(&place.icon));
-            row.set_tooltip_text(Some(&place.path.to_string_lossy()));
-            places.append(&row);
-        }
-        {
-            // A heading wherever the kind of place changes, so "Devices" and
-            // "Network" read as groups rather than one undifferentiated list.
-            let sections: Vec<&'static str> = shortcuts.iter().map(|p| p.section).collect();
-            places.set_header_func(move |row, before| {
-                let index = row.index() as usize;
-                let Some(current) = sections.get(index) else { return };
-                let previous = before.map(|b| b.index() as usize).and_then(|i| sections.get(i));
-                if previous == Some(current) {
-                    row.set_header(None::<&gtk::Widget>);
-                    return;
-                }
-                row.set_header(Some(
-                    &gtk::Label::builder()
-                        .label(*current)
-                        .xalign(0.0)
-                        .margin_start(14)
-                        .margin_top(if before.is_none() { 6 } else { 12 })
-                        .margin_bottom(2)
-                        .css_classes(["heading", "dim-label"])
-                        .build(),
-                ));
-            });
-        }
-        let places_pane = gtk::ScrolledWindow::builder()
-            .child(&places)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .width_request(200)
-            .build();
+        // The main window's sidebar, as it is. Rebuilding it here is what made
+        // the dialog look like a different program: oversized rows, no section
+        // headings, no capacity rings, and padding that drifted apart the
+        // moment either side changed.
+        let sidebar = crate::ui::sidebar::Sidebar::new();
+        sidebar.set_chooser_mode(true);
+        sidebar.set_favourites(config.borrow().favourites.clone());
+        let places_pane = sidebar.widget().clone();
+        places_pane.set_width_request(220);
 
         let name = gtk::Entry::builder()
             .placeholder_text("File name")
@@ -240,16 +230,17 @@ impl Chooser {
             name,
             accept,
             filters,
+            sidebar: Rc::clone(&sidebar),
             config,
             current: RefCell::new(PathBuf::new()),
             generation: Cell::new(0),
         });
 
-        this.wire(&cancel, places, shortcuts);
+        this.wire(&cancel, &hidden, &view_mode);
         this
     }
 
-    fn wire(self: &Rc<Self>, cancel: &gtk::Button, places: gtk::ListBox, shortcuts: Vec<Place>) {
+    fn wire(self: &Rc<Self>, cancel: &gtk::Button, hidden: &gtk::ToggleButton, view_mode: &gtk::Button) {
         let weak = Rc::downgrade(self);
         cancel.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -264,13 +255,79 @@ impl Chooser {
             }
         });
 
+        // Sidebar: a folder is opened, a drive is mounted first.
         let weak = Rc::downgrade(self);
-        places.connect_row_activated(move |_, row| {
-            let Some(this) = weak.upgrade() else { return };
-            if let Some(place) = shortcuts.get(row.index() as usize) {
-                this.navigate(place.path.clone());
+        self.sidebar.connect_navigate(move |path| {
+            if let Some(this) = weak.upgrade() {
+                this.navigate(path);
             }
         });
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_mount(move |volume| {
+            if let Some(this) = weak.upgrade() {
+                this.open_volume(volume);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_open_server(move |server| {
+            let Some(this) = weak.upgrade() else { return };
+            // Already-mounted shares have a path; connecting a new one is the
+            // main window's job.
+            if let Some(share) = crate::fs::remote::mounted()
+                .into_iter()
+                .find(|m| m.uri == server.uri())
+                .and_then(|m| m.path)
+            {
+                this.navigate(share);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.sidebar.connect_open_cloud(move |account| {
+            let Some(this) = weak.upgrade() else { return };
+            if account.mounted {
+                this.navigate(account.mount_point);
+            }
+        });
+
+        // Hidden files, as Ctrl+H does everywhere else.
+        let weak = Rc::downgrade(self);
+        hidden.connect_toggled(move |toggle| {
+            let Some(this) = weak.upgrade() else { return };
+            this.config.borrow_mut().show_hidden = toggle.is_active();
+            let current = this.current.borrow().clone();
+            this.navigate(current);
+        });
+
+        let weak = Rc::downgrade(self);
+        view_mode.connect_clicked(move |button| {
+            let Some(this) = weak.upgrade() else { return };
+            let next = match this.config.borrow().view_mode {
+                ViewMode::List => ViewMode::Grid,
+                ViewMode::Grid => ViewMode::List,
+            };
+            this.config.borrow_mut().view_mode = next;
+            this.view.set_view_mode(next);
+            button.set_icon_name(match next {
+                ViewMode::List => "view-grid-symbolic",
+                ViewMode::Grid => "view-list-symbolic",
+            });
+        });
+
+        // Ctrl+scroll zooms the icons, matching the main window.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        let weak = Rc::downgrade(self);
+        scroll.connect_scroll(move |controller, _, dy| {
+            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if !controller.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            if this.config.borrow_mut().zoom(if dy < 0.0 { 1 } else { -1 }) {
+                crate::ui::thumbs::clear();
+                this.view.refresh_items();
+            }
+            glib::Propagation::Stop
+        });
+        self.view.widget().add_controller(scroll);
 
         let weak = Rc::downgrade(self);
         self.pathbar.connect_navigate(move |path| {
@@ -325,13 +382,21 @@ impl Chooser {
         // Escape cancels, as it does in every other dialog on the desktop.
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, _| {
+        let hidden_button = hidden.clone();
+        let view_button = view_mode.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
             let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
-            if key == gdk::Key::Escape {
-                this.window.close();
-                return glib::Propagation::Stop;
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            match key {
+                gdk::Key::Escape => this.window.close(),
+                gdk::Key::h | gdk::Key::H if ctrl => {
+                    hidden_button.set_active(!hidden_button.is_active());
+                }
+                gdk::Key::v | gdk::Key::V if ctrl && shift => view_button.emit_clicked(),
+                _ => return glib::Propagation::Proceed,
             }
-            glib::Propagation::Proceed
+            glib::Propagation::Stop
         });
         self.window.add_controller(keys);
     }
@@ -347,6 +412,7 @@ impl Chooser {
         self.navigate(start);
         self.window.present();
         self.attach_to_parent();
+        self.add_drives();
         if self.request.kind() == Kind::Save {
             self.name.grab_focus();
             // Select the stem, so typing replaces the name but keeps `.png`.
@@ -374,9 +440,60 @@ impl Chooser {
         }
     }
 
+    /// Fills in the drives once UDisks2 answers.
+    ///
+    /// A D-Bus round trip, so it happens after the window is up rather than
+    /// delaying it. The sidebar draws them itself — capacity rings included —
+    /// which is the point of using it rather than a copy.
+    fn add_drives(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let volumes = crate::ui::actions::run_off_thread(crate::drives::list_volumes).await;
+            let Some(this) = weak.upgrade() else { return };
+            if let Ok(volumes) = volumes {
+                this.sidebar.set_volumes(volumes);
+            }
+
+            // Cloud drives read rclone's configuration, which is a subprocess
+            // of its own, so it follows the drives rather than holding them up.
+            let accounts = crate::ui::actions::run_off_thread(crate::fs::cloud::accounts).await;
+            if let Some(this) = weak.upgrade() {
+                this.sidebar.set_cloud(accounts);
+            }
+        });
+    }
+
+    /// Mounts a drive the user picked, then opens it.
+    fn open_volume(self: &Rc<Self>, volume: crate::drives::Volume) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let label = volume.label.clone();
+            let mounted = crate::ui::actions::run_off_thread({
+                let volume = volume.clone();
+                move || crate::drives::mount(&volume, false)
+            })
+            .await;
+            let Some(this) = weak.upgrade() else { return };
+
+            match mounted {
+                Ok(mounted) => this.navigate(mounted.path),
+                Err(crate::drives::MountError::AlreadyMounted(path)) => this.navigate(path),
+                Err(error) => {
+                    let dialog = adw::AlertDialog::new(
+                        Some(&format!("Could not open “{label}”")),
+                        Some(&error.message()),
+                    );
+                    dialog.add_response("close", "Close");
+                    dialog.present(Some(&this.window));
+                }
+            }
+        });
+    }
+
     fn navigate(self: &Rc<Self>, path: PathBuf) {
         *self.current.borrow_mut() = path.clone();
         self.pathbar.set_path(&path);
+        self.sidebar.set_current(&path);
         self.view.clear();
         self.update_accept();
 
@@ -503,110 +620,6 @@ impl Chooser {
         };
         self.window.close();
     }
-}
-
-/// One entry in the dialog's sidebar.
-struct Place {
-    section: &'static str,
-    label: String,
-    path: PathBuf,
-    icon: String,
-}
-
-/// Everywhere the user might want to put a file, cheaply.
-///
-/// Mounted volumes come from GIO's volume monitor, which answers from the
-/// mounts the session already knows about — no UDisks2 round trip, and it
-/// covers a USB disk, a Windows partition and a gvfs network share alike.
-/// rclone's cloud drives are FUSE mounts the monitor does not report, so those
-/// are read straight from the kernel's mount table.
-fn places() -> Vec<Place> {
-    let mut places: Vec<Place> = scan::xdg_places()
-        .into_iter()
-        .map(|(label, path, icon)| Place {
-            section: "Places",
-            label,
-            path,
-            icon: icon.to_string(),
-        })
-        .collect();
-
-    for favourite in Config::load().favourites {
-        if favourite.is_dir() {
-            places.push(Place {
-                section: "Favourites",
-                label: name_of(&favourite),
-                path: favourite,
-                icon: "starred-symbolic".into(),
-            });
-        }
-    }
-
-    let cloud_root = crate::fs::cloud::mount_root();
-    for mount in gio::VolumeMonitor::get().mounts() {
-        let root = mount.root();
-        let Some(path) = root.path() else { continue };
-        // The running system's own root is not a "place" to save into, and
-        // listing it alongside a USB stick is just noise.
-        if path == Path::new("/") || path.starts_with("/boot") {
-            continue;
-        }
-        let network = root
-            .uri_scheme()
-            .map(|scheme| {
-                matches!(
-                    scheme.as_str(),
-                    "smb" | "sftp" | "ssh" | "ftp" | "ftps" | "dav" | "davs" | "nfs" | "afp"
-                )
-            })
-            .unwrap_or(false);
-        places.push(Place {
-            section: if network { "Network" } else { "Devices" },
-            label: mount.name().to_string(),
-            path,
-            icon: if network { "folder-remote-symbolic" } else { "drive-removable-media-symbolic" }
-                .to_string(),
-        });
-    }
-
-    for path in fuse_mounts_under(&cloud_root) {
-        places.push(Place {
-            section: "Cloud",
-            label: name_of(&path),
-            path,
-            icon: "folder-remote-symbolic".into(),
-        });
-    }
-
-    // Grouped, but each group in the order it was built: XDG order is
-    // deliberate, and drives read best in the order they were mounted.
-    let order = |section: &str| match section {
-        "Places" => 0,
-        "Favourites" => 1,
-        "Devices" => 2,
-        "Network" => 3,
-        _ => 4,
-    };
-    places.sort_by_key(|place| order(place.section));
-    places.retain(|place| place.path.is_dir());
-    places
-}
-
-fn name_of(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
-}
-
-/// Mount points directly under `root`, read from the kernel's mount table.
-fn fuse_mounts_under(root: &Path) -> Vec<PathBuf> {
-    let Ok(table) = std::fs::read_to_string("/proc/self/mountinfo") else { return Vec::new() };
-    table
-        .lines()
-        .filter_map(|line| line.split(' ').nth(4))
-        .map(|point| PathBuf::from(point.replace("\\040", " ")))
-        .filter(|point| point.parent() == Some(root))
-        .collect()
 }
 
 /// Who is asking, for the subtitle — "Zen Browser wants a file" is far more

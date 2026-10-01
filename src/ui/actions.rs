@@ -2032,12 +2032,18 @@ impl Window {
             match crate::portal::set_enabled(enabled) {
                 Ok(_) => {
                     row.set_subtitle(&portal_subtitle());
-                    // The running portal caches its configuration, so without
-                    // a restart the change appears to have done nothing.
-                    this.toast(if enabled {
-                        "Fileman will handle file dialogs — restart the portal or log in again"
-                    } else {
-                        "File dialogs handed back to the desktop's default"
+                    // Writing the preference is not enough on its own: the bus
+                    // has to notice the backend exists and the portal has to
+                    // re-read which one to use, or the switch appears to have
+                    // done nothing at all.
+                    crate::portal::reload_dbus();
+                    let applied = crate::portal::restart_portal();
+                    this.toast(match (enabled, applied) {
+                        (true, true) => "Fileman now handles file dialogs",
+                        (true, false) => {
+                            "Fileman will handle file dialogs — restart xdg-desktop-portal to apply"
+                        }
+                        (false, _) => "File dialogs handed back to the desktop's default",
                     });
                 }
                 Err(error) => {
@@ -2156,8 +2162,7 @@ impl Window {
 /// Says where the file-dialog setting is written, and what it needs to apply.
 fn portal_subtitle() -> String {
     if crate::portal::is_enabled() {
-        "Takes effect after `systemctl --user restart xdg-desktop-portal` or the next login"
-            .to_string()
+        "Other applications open their file dialogs in Fileman".to_string()
     } else {
         "Needs the fileman-portal service, which the installer sets up".to_string()
     }

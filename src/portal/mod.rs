@@ -278,6 +278,42 @@ pub fn set_enabled(enabled: bool) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Tells the session bus to rescan its service directories.
+///
+/// Without this a freshly installed backend does not exist as far as D-Bus is
+/// concerned: the bus reads its service files once at startup, so until the
+/// next login every file dialog fails with
+/// `Backend call failed: The name is not activatable` and the user is told
+/// nothing at all. Installing and enabling both call this, so the feature
+/// works the moment it is turned on rather than after a reboot.
+pub fn reload_dbus() -> bool {
+    let Ok(connection) = zbus::blocking::Connection::session() else { return false };
+    connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "ReloadConfig",
+            &(),
+        )
+        .is_ok()
+}
+
+/// Restarts `xdg-desktop-portal`, which caches which backend serves what and
+/// will otherwise keep using the previous one for the rest of the session.
+///
+/// Best effort: a session without systemd simply gets `false`, and the caller
+/// says what to do by hand.
+pub fn restart_portal() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "restart", "xdg-desktop-portal"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

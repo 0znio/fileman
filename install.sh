@@ -205,21 +205,16 @@ disable_portal_config() {
 # Turns Fileman on as the file chooser, as the invoking user: the preference
 # lives in their config, not root's, even when the install needed sudo.
 enable_portal_config() {
+    # `--enable` writes the preference and clears both caches that stand in
+    # the way: the bus's service list and the portal's choice of backend.
     if [ -n "${SUDO_USER:-}" ]; then
-        sudo -u "$SUDO_USER" "$BINDIR/$PORTAL_BIN" --enable >/dev/null 2>&1
+        uid=$(id -u "$SUDO_USER" 2>/dev/null)
+        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" \
+            "$BINDIR/$PORTAL_BIN" --enable >/dev/null 2>&1
     else
         "$BINDIR/$PORTAL_BIN" --enable >/dev/null 2>&1
     fi || { warn "could not enable it — run: $PORTAL_BIN --enable"; return 1; }
 
-    # The running portal caches its configuration, so without a restart the
-    # change appears to have done nothing at all.
-    if [ -n "${SUDO_USER:-}" ]; then
-        uid=$(id -u "$SUDO_USER" 2>/dev/null)
-        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" \
-            systemctl --user restart xdg-desktop-portal >/dev/null 2>&1 || true
-    else
-        systemctl --user restart xdg-desktop-portal >/dev/null 2>&1 || true
-    fi
     ok "Fileman is now the Open/Save dialog for other applications"
     say "  turn it off any time with: $PORTAL_BIN --disable"
     return 0
@@ -284,6 +279,17 @@ place_portal() {
         ensure_scratch
         sed -e "s|@LIBEXECDIR@|$LIBEXECDIR|" "$3" > "$WORK/$PORTAL_SERVICE"
         maybe_root install -Dm644 "$WORK/$PORTAL_SERVICE" "$DBUSDIR/$PORTAL_SERVICE"
+    fi
+    # The session bus reads its service files once, at startup. A backend
+    # installed afterwards does not exist as far as D-Bus is concerned, and
+    # every file dialog fails with "The name is not activatable" until the
+    # next login — so ask it to rescan now, as the user whose bus it is.
+    if [ -n "${SUDO_USER:-}" ]; then
+        uid=$(id -u "$SUDO_USER" 2>/dev/null)
+        sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$uid" \
+            "$BINDIR/$PORTAL_BIN" --refresh >/dev/null 2>&1 || true
+    else
+        "$BINDIR/$PORTAL_BIN" --refresh >/dev/null 2>&1 || true
     fi
     PORTAL_INSTALLED="yes"
 }

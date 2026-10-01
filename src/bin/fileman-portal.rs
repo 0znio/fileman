@@ -45,6 +45,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.next().as_deref() {
         Some("--enable") => switch(true),
         Some("--disable") => switch(false),
+        Some("--refresh") => {
+            // Used by the installer: makes a newly installed backend visible
+            // to the bus without waiting for the next login.
+            portal::reload_dbus();
+            Ok(())
+        }
         Some("--status") => {
             status();
             Ok(())
@@ -67,7 +73,8 @@ fileman-portal — makes Fileman the file dialog other applications open
   fileman-portal            run the backend (started by xdg-desktop-portal)
   fileman-portal --enable   use Fileman for Open and Save dialogs
   fileman-portal --disable  hand them back to the previous backend
-  fileman-portal --status   show which backend is in use";
+  fileman-portal --status   show which backend is in use
+  fileman-portal --refresh  make a freshly installed backend visible to D-Bus";
 
 fn switch(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
     let path = portal::set_enabled(enable)?;
@@ -76,11 +83,17 @@ fn switch(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("The file chooser is back to the desktop's default.\nWrote {}", path.display());
     }
-    // The running portal caches its configuration, so the change lands at the
-    // next login unless it is restarted. Saying so beats the user concluding
-    // it did not work.
-    println!("\nRestart the portal for it to take effect now:");
-    println!("  systemctl --user restart xdg-desktop-portal");
+
+    // Two caches stand between the configuration and it working, and leaving
+    // either to the user means the feature looks broken: the bus has to notice
+    // the backend exists, and the portal has to re-read which backend to use.
+    portal::reload_dbus();
+    if portal::restart_portal() {
+        println!("\nThe portal has been restarted — it is in effect now.");
+    } else {
+        println!("\nRestart the portal for it to take effect now:");
+        println!("  systemctl --user restart xdg-desktop-portal");
+    }
     Ok(())
 }
 

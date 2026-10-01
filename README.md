@@ -194,7 +194,10 @@ fileman-portal --status     # show which backend is in use
 
 There is a switch for the same thing in **Preferences → System dialogs**.
 
-Either way, the portal caches its configuration, so the change applies after:
+Either way it applies straight away — no logout. Two caches sit between the
+setting and it working, and both are cleared for you: the session bus has to
+notice the backend exists at all, and `xdg-desktop-portal` has to re-read which
+backend to use. On a session without systemd, restart the portal yourself:
 
 ```sh
 systemctl --user restart xdg-desktop-portal
@@ -288,9 +291,8 @@ widget.
 No split view · each network protocol needs its own gvfs backend installed, and
 the connect dialog says which · video plays in the preview only when GStreamer
 has the codec (`gst-plugins-good`, `gst-libav`), otherwise it shows a still frame
-· the file-dialog backend needs `xdg-desktop-portal` 1.18 or newer, and a
-portal restart (or re-login) after switching · the downloader has no queue or
-resume yet.
+· the file-dialog backend needs `xdg-desktop-portal` 1.18 or newer · the
+downloader has no queue or resume yet.
 
 ## Licence
 
